@@ -1,0 +1,173 @@
+BaseConfig:
+  minDetectorConfidence: 0.05
+  # 偵測器最低信心值（0~1）
+  # ↓ 越小：抓更多物件（含雜訊）→ ID 較穩但可能誤檢
+  # ↑ 越大：更乾淨 → 但容易漏檢 → ID 斷掉
+
+TargetManagement:
+  enableBboxUnClipping: 0
+  # 是否把貼邊框的 bbox「拉回完整」
+  # 0 = 不處理（你現在）
+  # 1 = 會修正邊界裁切（有些情況 bbox 會變大）
+
+  preserveStreamUpdateOrder: 1
+  # 是否固定 ID 分配順序（多路串流用）
+  # 1 = ID 比較穩定（推薦）
+
+  maxTargetsPerStream: 50
+  # 每路最多追蹤幾個物件
+  # ↑ 越大：可追更多，但吃資源
+  # ↓ 越小：省資源，但可能漏追
+
+  minIouDiff4NewTarget: 0.3
+  # 判斷「是不是新物件」的 IOU 門檻
+  # ↓ 越小：比較不容易開新ID（穩）
+  # ↑ 越大：容易產生新ID（ID會跳）
+
+  minTrackerConfidence: 0.6
+  # tracker 自身信心門檻
+  # ↓ 越小：弱 tracking 也保留（容易飄）
+  # ↑ 越大：只保留穩定框（但可能提前消失）
+
+  probationAge: 3
+  # 新ID要存活幾幀才「正式成立」
+  # ↓ 越小：ID 很快出現（但容易亂）
+  # ↑ 越大：ID 更穩，但會延遲出現
+
+  maxShadowTrackingAge: 300
+  # 物件消失後最多撐幾幀（shadow）
+  # ↓ 越小：很快刪ID（容易斷）
+  # ↑ 越大：可以長時間復活ID（但可能誤接）
+
+  earlyTerminationAge: 2
+  # 在 probation 期間，如果進入 shadow 幾幀就刪掉
+  # ↓ 越小：更嚴格（避免假ID）
+  # ↑ 越大：容忍短暫消失
+
+TrajectoryManagement:
+  useUniqueID: 0
+  # 是否使用全域唯一ID（64-bit）
+  # 0 = 簡單遞增ID（你現在）
+  # 1 = 不會重複（但數字很大）
+
+DataAssociator:
+  dataAssociatorType: 0
+  # 關聯方法（通常用 0 預設）
+
+  associationMatcherType: 1
+  # 0 = GREEDY（快但不穩）
+  # 1 = CASCADED（較穩ID，你現在用）
+
+  checkClassMatch: 1
+  # 是否只讓同類別互相匹配（建議開）
+
+  minMatchingScore4Overall: 0.25
+  # 總匹配分數門檻
+  # ↓ 越小：更容易配對（ID穩但可能錯）
+  # ↑ 越大：更嚴格（容易斷ID）
+
+  minMatchingScore4SizeSimilarity: 0.25
+  # 尺寸相似度門檻
+  # ↓ 容忍尺寸變化
+  # ↑ 尺寸差太多就不配
+
+  minMatchingScore4Iou: 0.25
+  # IOU 門檻（位置重疊）
+  # ↓ 容忍位置偏移（適合停車）
+  # ↑ 要求更準確位置
+
+  minMatchingScore4VisualSimilarity: 0.5
+  # 外觀相似度門檻
+  # ↓ 不太依賴外觀
+  # ↑ 很依賴顏色/特徵
+
+  matchingScoreWeight4VisualSimilarity: 0.5
+  # 外觀權重
+  # ↑ 越高：靠外觀（像 DeepSORT）
+  # ↓ 越低：不看外觀
+
+  matchingScoreWeight4SizeSimilarity: 0.25
+  # 尺寸權重
+  # ↑ 對 bbox 大小敏感
+
+  matchingScoreWeight4Iou: 0.5
+  # IOU 權重（你現在主導）
+  # ↑ 越像 IOU tracker（貼 bbox）
+  # ↓ 越不看位置
+
+  tentativeDetectorConfidence: 0.3
+  # 「弱偵測」門檻
+  # 低於這個但高於 minDetectorConfidence → tentative
+  # ↓ 更多框參與匹配
+  # ↑ 更乾淨但可能斷ID
+
+  minMatchingScore4TentativeIou: 0.45
+  # tentative 只用 IOU 時的門檻
+  # ↓ 容易接回ID
+  # ↑ 更嚴格
+
+StateEstimator:
+  stateEstimatorType: 1
+  # 0 = 不用 Kalman
+  # 1 = 簡單 Kalman（你現在）
+  # 2 = 複雜模型
+
+  processNoiseVar4Loc: 2.0
+  # 位置「預測不確定性」
+  # ↑ 越大：不信預測 → 更跟 detector
+  # ↓ 越小：相信平滑運動（可能飄）
+
+  processNoiseVar4Size: 2.0
+  # bbox 尺寸變化不確定性
+  # ↑ 容忍尺寸變動（避免縮框）
+  # ↓ 尺寸更穩定（但可能錯）
+
+  processNoiseVar4Vel: 0.05
+  # 速度變化
+  # ↑ 容忍加減速（適合紅綠燈）
+  # ↓ 假設等速（容易預測錯）
+
+  measurementNoiseVar4Detector: 1.5
+  # detector 測量誤差
+  # ↓ 越小：更相信 detector
+  # ↑ 越大：不太信 detector
+
+  measurementNoiseVar4Tracker: 8.0
+  # tracker 測量誤差
+  # ↑ 越大：不信 tracker（你現在）
+  # ↓ 越小：更依賴 tracker
+
+VisualTracker:
+  visualTrackerType: 1
+  # 1 = NvDCF
+
+  useColorNames: 1
+  # 使用顏色特徵（輕量）
+
+  useHog: 0
+  # 是否用 HOG（形狀特徵）
+  # 0 = 省資源
+  # 1 = 更穩但很重
+
+  featureImgSizeLevel: 3
+  # 特徵圖大小（1~5）
+  # ↑ 越大：更準但更慢
+  # ↓ 越小：更快但粗糙
+
+  featureFocusOffsetFactor_y: 0.0
+  # 特徵中心 Y 偏移
+  # <0 往上（會造成懸空）
+  # =0 正中央（你現在正確）
+
+  filterLr: 0.04
+  # DCF filter 更新速度
+  # ↓ 越小：更新慢 → 更穩
+  # ↑ 越大：反應快 → 可能飄
+
+  filterChannelWeightsLr: 0.04
+  # 各特徵權重更新速度（同上）
+
+  gaussianSigma: 0.6
+  # DCF 高斯分布範圍
+  # ↓ 越小：更精準但敏感
+  # ↑ 越大：更平滑但可能偏移

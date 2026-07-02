@@ -1,0 +1,54 @@
+# Python 相關
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虛擬環境
+venv/
+.venv/
+env/
+ENV/
+
+# IDE 設定
+.vscode/
+.idea/
+*.swp
+
+# 系統檔案
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 模型權重檔
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.h5
+*.weights
+
+# 影片與大型媒體
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# 資料集與輸出
+datasets/
+runs/
+output/
+outputs/
+results/
+logs/
+
+# 其他
+*.log
+.env

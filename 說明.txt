@@ -1,0 +1,72 @@
+pip install -r requirements.txt
+export CUDA_VER=12.6
+make -C nvdsinfer_custom_impl_Yolo clean && make -C nvdsinfer_custom_impl_Yolo
+
+# ========================================
+# 階段一：PyTorch (.pt) 轉換為 ONNX (.onnx)
+# 說明：針對車牌進行權重匯出
+# ========================================
+
+# [車輛偵測] 固定批次大小 (batch=4)
+python utils/export_yolo11.py -w weight/car.pt --simplify --batch=4
+
+# ========================================
+# 階段二：ONNX (.onnx) 轉換為 TensorRT (.engine)
+# 說明：批次處理版本，依模型特性選用對應轉換工具
+# ========================================
+
+# [車輛] 使用自訂腳本進行批次轉換
+python onnx2engine.py
+    
+# ========================================
+# 階段三：模型測試與 DeepStream 部署驗證
+# ========================================
+
+# [前處理] 手動修改 ds_yaml 資料夾所有 *.yaml 設定
+
+# [本地測試] 執行車流統計腳本
+python traffic_count_txt.py
+
+python main.py
+
+# 無終端機 CLI
+python main.py < /dev/null
+
+# ========================================
+# 附錄：歷史做法 / 備註 (僅供參考，非當前流程)
+# ========================================
+
+# [舊版轉換] 單一車輛模型 FP16 轉換 (無動態 Shape 設定)
+/usr/src/tensorrt/bin/trtexec \
+    --onnx=weight/car.onnx \
+    --saveEngine=car_fp16.engine \
+    --fp16
+
+# [標準部署] 載入預設設定檔執行
+deepstream-app -c deepstream_app_config.txt
+
+# [錄影模式] 啟用影片儲存功能
+deepstream-app -c deepstream_app_config_save_vid.txt
+
+# [串流模式] 啟用 RTSP 輸出功能
+deepstream-app -c deepstream_app_config_RTSP.txt
+
+# ========================================
+# ⚠️ 禁止使用 / 錯誤示範 (已知有問題或不適用當前環境)
+# ========================================
+
+# ❌ 錯誤 1：車輛模型不應使用 dynamic 參數 (會與固定 batch 設定衝突)
+python utils/export_yolo11.py -w weight/car.pt --dynamic --simplify
+
+# ❌ 錯誤 2：車輛模型使用 640 解析度動態範圍 (與專案當前設定不符)
+/usr/src/tensorrt/bin/trtexec \
+    --onnx=weight/car.onnx \
+    --saveEngine=weight/car_fixed_b2.engine \
+    --fp16 \
+    --minShapes=input:1x3x640x640 \
+    --optShapes=input:4x3x640x640 \
+    --maxShapes=input:8x3x640x640
+
+# ❌ 錯誤 3：直接使用 yolo CLI 匯出 engine (易產生版本不相容或缺少針對性最佳化)
+yolo export model=weight/plate.pt format=engine half=True device=0 batch=16
+yolo export model=weight/num.pt format=engine half=True device=0 batch=16
