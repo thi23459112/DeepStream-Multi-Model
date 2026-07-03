@@ -3,3 +3,4 @@ ftfy
 regex
 loguru
 lapx
+pandas
