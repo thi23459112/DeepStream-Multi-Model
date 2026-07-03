@@ -4,3 +4,4 @@ regex
 loguru
 lapx
 pandas
+scipy
