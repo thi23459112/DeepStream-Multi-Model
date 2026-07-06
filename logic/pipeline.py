@@ -4,12 +4,14 @@ pipeline.py
 -----------
 GStreamer pipeline 元件建構與分支邏輯（多權重 / 多 pipeline 版）。
 
-重要觀念：
-    本專案依 weight 分組，每組跑「一條獨立 pipeline」。
+平台自動適配：
+    以 _is_jetson() 判斷平台（Jetson 或 dGPU/WSL2），在「顯示 sink、OSD 處理模式、
+    NVENC 編碼器屬性」上自動選用該平台支援的設定，使同一份程式碼於兩種環境皆可執行。
+
+分組觀念：
+    依 weight 分組，每組跑一條獨立 pipeline。
     - 區域 pad_index：某條 pipeline 內 streammux/demux 的 sink_/src_ 編號（各組從 0 起算）
     - 全域 stream_uid：跨所有組唯一的編號（= SOURCE_CONFIGS 的鍵）
-    setup_cam_branch 同時收 local_idx（接 demux/display 的 pad 用）與 uid
-    （命名、OSD 探針、狀態鍵用），避免多條 pipeline 之間互相污染。
 
 每路 cam 的下游分支由 YAML 決定：
     - output.save_output_video → 寫檔分支（存成 mp4）
@@ -17,9 +19,22 @@ GStreamer pipeline 元件建構與分支邏輯（多權重 / 多 pipeline 版）
 """
 
 import sys
+import os
+import platform
 from gi.repository import Gst
 
-from logic.config import SOURCE_CONFIGS
+
+def _is_jetson():
+    """判斷是否為 Jetson（aarch64 或存在 /etc/nv_tegra_release）；dGPU / WSL2 回傳 False。"""
+    return (platform.machine() == "aarch64") or os.path.isfile("/etc/nv_tegra_release")
+
+
+def _safe_set(elm, name, value):
+    """僅在元件確實具有該屬性時才設定，避免跨平台屬性差異造成例外。回傳是否設定成功。"""
+    if elm.find_property(name) is not None:
+        elm.set_property(name, value)
+        return True
+    return False
 
 
 # ==========================================
@@ -27,26 +42,48 @@ from logic.config import SOURCE_CONFIGS
 # ==========================================
 def cb_newpad(decodebin, decoder_src_pad, data):
     """
-    uridecodebin 動態 pad 出現時，鏈到「該組」streammux 的區域 sink_{local_idx}。
+    uridecodebin 解出動態 pad 時的處理：把 video pad 接到該組 streammux 的 sink_{pad_index}。
+    非 video pad（音訊等）或重複的 video pad 一律接 fakesink 消化，避免未連結 pad 造成反壓。
 
-    data 需含：
-        "streammux"  : 該組的 streammux
-        "pad_index"  : 區域 pad index（該組內從 0 起算）
+    data 需含："streammux"（該組 streammux）、"pad_index"（區域 pad index）。
     """
     caps = decoder_src_pad.get_current_caps()
     if not caps:
         caps = decoder_src_pad.query_caps()
 
-    if caps.get_structure(0).get_name().find("video") != -1:
-        sinkpad = data["streammux"].get_request_pad(f"sink_{data['pad_index']}")
-        if not sinkpad.is_linked():
-            decoder_src_pad.link(sinkpad)
+    is_video = caps.get_structure(0).get_name().find("video") != -1
+    streammux = data["streammux"]
+    pipeline = streammux.get_parent()
+    pad_name = f"sink_{data['pad_index']}"
+
+    # 對已請求過的 request pad 再次 get_request_pad 會回傳 None，故先取回既有 pad
+    sinkpad = streammux.get_static_pad(pad_name)
+    if sinkpad is None:
+        sinkpad = streammux.get_request_pad(pad_name)
+
+    # 非影像流，或該路已接過一條 video → 導到 fakesink 消化，避免佔用/反壓
+    if (not is_video) or sinkpad is None or sinkpad.is_linked():
+        _drain_pad_to_fakesink(pipeline, decoder_src_pad)
+        return
+
+    decoder_src_pad.link(sinkpad)
+
+
+def _drain_pad_to_fakesink(pipeline, src_pad):
+    """把不需要的 pad（音訊 / 多餘視訊）接到 fakesink 消化，避免未連結 pad 造成反壓卡整路。"""
+    fs = Gst.ElementFactory.make("fakesink", None)  # None=自動命名，避免多路撞名
+    if fs is None:
+        return
+    fs.set_property("sync", False)
+    fs.set_property("async", False)
+    pipeline.add(fs)
+    fs.sync_state_with_parent()
+    src_pad.link(fs.get_static_pad("sink"))
 
 
 def cb_source_setup(decodebin, source_element, user_data):
-    """來源若是 RTSP 網路攝影機，注入防斷線 / 低延遲參數（僅對 rtspsrc 生效）。"""
+    """RTSP 網路攝影機來源的調校：強制 TCP、設定抖動緩衝與逾時（僅對內部 rtspsrc 生效）。"""
     if source_element.get_name().startswith("rtspsrc"):
-        print(f"[INFO] 偵測到 RTSP 來源，注入防斷線參數: {source_element.get_name()}")
         source_element.set_property("protocols", 4)           # 4 = TCP
         source_element.set_property("latency", 200)           # 抖動緩衝 200ms
         source_element.set_property("timeout", 5000000)       # 連線逾時 5 秒（微秒）
@@ -54,7 +91,7 @@ def cb_source_setup(decodebin, source_element, user_data):
 
 
 def make_elm(gst_type, name):
-    """建立單一 GStreamer 元件，失敗則整支程式退出。"""
+    """建立單一 GStreamer 元件，失敗則整支程式退出並提示型別/名稱。"""
     elm = Gst.ElementFactory.make(gst_type, name)
     if not elm:
         sys.exit(f"[ERROR] 無法建立 element: {gst_type} ({name})")
@@ -87,15 +124,15 @@ def _get_tile_layout(num_sources):
 
 
 # ==========================================
-# 寫檔分支：本地檔案來源
+# 寫檔分支（檔案 / RTSP 來源共用）
 # ==========================================
-def _build_save_branch_for_file(pipeline, uid, video_path, source_fps):
+def _build_save_branch(pipeline, uid, video_path, source_fps):
     """
-    寫檔分支（檔案來源版）：
-        nvvideoconvert → videorate → capsfilter(NV12,N/1) → nvv4l2h264enc
-        → h264parse → qtmux → filesink
-    插 videorate 用固定 framerate 重打 PTS，避免 live-source=1 造成 PTS 不規律、qtmux 拒收。
-    元件命名用全域 uid，確保跨 pipeline 不撞名。回傳分支起點 element。
+    寫檔分支：nvvideoconvert → videorate → capsfilter(NV12,N/1) → nvv4l2h264enc
+             → h264parse → qtmux → filesink。
+    videorate 以固定 framerate 重打 PTS，避免 live-source 造成 PTS 不規律使 qtmux 拒收。
+    編碼器屬性以 _safe_set 設定，Jetson 專有屬性在 dGPU/WSL2 會自動略過。
+    回傳分支起點 element（供上游 link）。
     """
     i = uid
 
@@ -112,62 +149,19 @@ def _build_save_branch_for_file(pipeline, uid, video_path, source_fps):
     )
 
     encoder = make_elm("nvv4l2h264enc", f"encoder-{i}")
-    encoder.set_property("bitrate", 4000000)
-    encoder.set_property("preset-level", 1)
-    encoder.set_property("insert-sps-pps", 1)
-    encoder.set_property("profile", 0)
-    encoder.set_property("maxperf-enable", 1)
-    encoder.set_property("iframeinterval", fps_int)
+    _safe_set(encoder, "bitrate", 4000000)
+    _safe_set(encoder, "profile", 0)
+    _safe_set(encoder, "iframeinterval", fps_int)
+    # preset-level / insert-sps-pps / maxperf-enable 為 Jetson NVENC 專有；
+    # 若一個都設不成功，代表在 dGPU/WSL2，改設 dGPU NVENC 的調校屬性。
+    if not (_safe_set(encoder, "preset-level", 1)
+            | _safe_set(encoder, "insert-sps-pps", 1)
+            | _safe_set(encoder, "maxperf-enable", 1)):
+        _safe_set(encoder, "preset-id", 1)
+        _safe_set(encoder, "tuning-info-id", 2)
 
     parser = make_elm("h264parse", f"h264-parser-{i}")
     muxer = make_elm("qtmux", f"muxer-{i}")
-    muxer.set_property("dts-method", 1)
-    filesink = make_elm("filesink", f"filesink-{i}")
-    filesink.set_property("location", video_path)
-    filesink.set_property("async", False)
-    filesink.set_property("sync", False)
-
-    for elm in [nvvidconv_s, videorate, cap_filter, encoder, parser, muxer, filesink]:
-        pipeline.add(elm)
-
-    nvvidconv_s.link(videorate)
-    videorate.link(cap_filter)
-    cap_filter.link(encoder)
-    encoder.link(parser)
-    parser.link(muxer)
-    muxer.link(filesink)
-
-    return nvvidconv_s
-
-
-# ==========================================
-# 寫檔分支：RTSP 攝影機來源
-# ==========================================
-def _build_save_branch_for_rtsp(pipeline, uid, video_path, source_fps):
-    """寫檔分支（RTSP 攝影機來源版）：同樣插 videorate 穩定 framerate 後再編碼。"""
-    i = uid
-
-    nvvidconv_s = make_elm("nvvideoconvert", f"convertor-save-{i}")
-    nvvidconv_s.set_property("nvbuf-memory-type", 0)
-
-    videorate  = make_elm("videorate", f"videorate-{i}")
-    cap_filter = make_elm("capsfilter", f"cap-filter-save-{i}")
-    fps_int = int(round(source_fps)) if source_fps and source_fps > 0 else 30
-    cap_filter.set_property(
-        "caps",
-        Gst.Caps.from_string(f"video/x-raw(memory:NVMM), format=NV12, framerate={fps_int}/1"),
-    )
-
-    encoder = make_elm("nvv4l2h264enc", f"encoder-{i}")
-    encoder.set_property("bitrate", 4000000)
-    encoder.set_property("preset-level", 1)
-    encoder.set_property("insert-sps-pps", 1)
-    encoder.set_property("profile", 0)
-    encoder.set_property("maxperf-enable", 1)
-    encoder.set_property("iframeinterval", fps_int)
-
-    parser = make_elm("h264parse", f"h264-parser-{i}")
-    muxer  = make_elm("qtmux", f"muxer-{i}")
     muxer.set_property("dts-method", 1)
     filesink = make_elm("filesink", f"filesink-{i}")
     filesink.set_property("location", video_path)
@@ -193,17 +187,13 @@ def _build_save_branch_for_rtsp(pipeline, uid, video_path, source_fps):
 def _build_display_sink(pipeline, group_id, num_members):
     """
     為「單一組」建立一個 tile 預覽視窗：
-        streammux(顯示用) → tiler → nvvideoconvert → nvegltransform → nveglglessink
+        streammux(顯示用) → tiler → nvvideoconvert →（依平台選）顯示 sink
     回傳顯示用 streammux（該組各路顯示分支接它的 sink_{local_idx}）。
 
-    live-source / batched-push-timeout 與主線一致（1 / 16666），
-    某路 EOS 後不會死等、反壓不會頂回主線。
-    元件命名帶 group_id，避免多組視窗撞名。
-
-    參數：
-        pipeline     : 該組的 Gst.Pipeline
-        group_id     : 組別（用於元件命名 + 視窗識別）
-        num_members  : 該組成員數（決定 tile 佈局與 batch-size）
+    顯示 sink 依平台自動選擇：
+      - 有 NVIDIA sink（nveglglessink / nv3dsink）→ 走 NVMM；Jetson 另加 nvegltransform。
+      - 否則（dGPU / WSL2 常見）→ 用 nvvideoconvert 轉出系統記憶體，交給標準 GStreamer sink。
+        可用環境變數 DS_DISPLAY_SINK 指定要用哪個標準 sink。
     """
     rows, cols, total_w, total_h = _get_tile_layout(num_members)
     print(f"[INFO] [group{group_id}] Tile 佈局: {rows}x{cols}, 視窗尺寸: {total_w}x{total_h}")
@@ -213,8 +203,8 @@ def _build_display_sink(pipeline, group_id, num_members):
     streammux2.set_property("width", 1920)
     streammux2.set_property("height", 1080)
     streammux2.set_property("batch-size", num_members)
-    streammux2.set_property("batched-push-timeout", 16666)   # 與主線一致
-    streammux2.set_property("live-source", 1)                # 與主線一致
+    streammux2.set_property("batched-push-timeout", 16666)
+    streammux2.set_property("live-source", 1)
     streammux2.set_property("nvbuf-memory-type", 0)
 
     tiler = make_elm("nvmultistreamtiler", f"nvtiler-display-g{g}")
@@ -227,23 +217,69 @@ def _build_display_sink(pipeline, group_id, num_members):
     nvvidconv = make_elm("nvvideoconvert", f"convertor-display-g{g}")
     nvvidconv.set_property("nvbuf-memory-type", 0)
     q_d2 = make_elm("queue", f"q-display-2-g{g}")
-    transform = make_elm("nvegltransform", f"nvegl-transform-display-g{g}")
     q_d3 = make_elm("queue", f"q-display-3-g{g}")
 
-    sink = make_elm("nveglglessink", f"nvvideo-renderer-display-g{g}")
-    sink.set_property("sync", False)
-    sink.set_property("qos", False)
+    # 先找 NVIDIA 專用 sink（吃 NVMM，可直送）；dGPU/WSL2 通常沒有，回傳 None
+    nv_sink = None
+    if Gst.ElementFactory.find("nveglglessink") is not None:
+        nv_sink = make_elm("nveglglessink", f"nvvideo-renderer-display-g{g}")
+    elif Gst.ElementFactory.find("nv3dsink") is not None:
+        nv_sink = make_elm("nv3dsink", f"nvvideo-renderer-display-g{g}")
 
-    for elm in [streammux2, tiler, q_d1, nvvidconv, q_d2, transform, q_d3, sink]:
-        pipeline.add(elm)
+    if nv_sink is not None:
+        # ---- 路徑 A：NVIDIA 專用 sink（走 NVMM，Jetson 視情況加 nvegltransform）----
+        sink = nv_sink
+        sink.set_property("sync", False)
+        _safe_set(sink, "qos", False)
+        use_egltransform = _is_jetson() and (Gst.ElementFactory.find("nvegltransform") is not None)
+        if use_egltransform:
+            transform = make_elm("nvegltransform", f"nvegl-transform-display-g{g}")
+            elements = [streammux2, tiler, q_d1, nvvidconv, q_d2, transform, q_d3, sink]
+        else:
+            elements = [streammux2, tiler, q_d1, nvvidconv, q_d2, q_d3, sink]
+        for elm in elements:
+            pipeline.add(elm)
+        streammux2.link(tiler)
+        tiler.link(q_d1)
+        q_d1.link(nvvidconv)
+        nvvidconv.link(q_d2)
+        if use_egltransform:
+            q_d2.link(transform)
+            transform.link(q_d3)
+        else:
+            q_d2.link(q_d3)
+        q_d3.link(sink)
+    else:
+        # ---- 路徑 B：標準 GStreamer sink（dGPU / WSL2）----
+        # nvvideoconvert 先把畫面從 NVMM 轉到系統記憶體，再交給標準 sink 顯示
+        caps_sys = make_elm("capsfilter", f"caps-display-sys-g{g}")
+        caps_sys.set_property("caps", Gst.Caps.from_string("video/x-raw, format=RGBA"))
+        videoconv = make_elm("videoconvert", f"videoconvert-display-g{g}")
 
-    streammux2.link(tiler)
-    tiler.link(q_d1)
-    q_d1.link(nvvidconv)
-    nvvidconv.link(q_d2)
-    q_d2.link(transform)
-    transform.link(q_d3)
-    q_d3.link(sink)
+        # 未指定 DS_DISPLAY_SINK 時，依 WSLg 穩定度排序自動挑選可用 sink
+        forced = os.environ.get("DS_DISPLAY_SINK", "").strip()
+        candidates = [forced] if forced else ["ximagesink", "glimagesink", "autovideosink"]
+        std_sink = None
+        for cand in candidates:
+            if cand and Gst.ElementFactory.find(cand) is not None:
+                std_sink = make_elm(cand, f"nvvideo-renderer-display-g{g}")
+                print(f"[INFO] [group{g}] 使用標準顯示 sink：{cand}")
+                break
+        if std_sink is None:
+            sys.exit(f"[ERROR] 找不到可用的顯示 sink（嘗試清單：{candidates}）")
+        _safe_set(std_sink, "sync", False)
+        sink = std_sink
+
+        elements = [streammux2, tiler, q_d1, nvvidconv, caps_sys, videoconv, q_d2, sink]
+        for elm in elements:
+            pipeline.add(elm)
+        streammux2.link(tiler)
+        tiler.link(q_d1)
+        q_d1.link(nvvidconv)
+        nvvidconv.link(caps_sys)
+        caps_sys.link(videoconv)
+        videoconv.link(q_d2)
+        q_d2.link(sink)
 
     return streammux2
 
@@ -253,18 +289,11 @@ def _build_display_sink(pipeline, group_id, num_members):
 # ==========================================
 def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, osd_probe_callback):
     """
-    為單路 cam 建立完整下游分支。
-
-    參數：
-        pipeline           : 該組的 Gst.Pipeline
-        local_idx          : 該組 pipeline 內的區域 pad index（接 demux/display pad 用）
-        uid                : 全域 stream_uid（元件命名、OSD 探針、狀態鍵用）
-        cfg                : 此路設定（來自 SOURCE_CONFIGS[uid]）
-        demux              : 該組的 nvstreamdemux
-        display_streammux  : 該組的顯示用 mux（無顯示時為 None）
-        osd_probe_callback : OSD 探針回呼（畫 FPS / ROI）；會用 uid 綁定
+    為單路 cam 建立下游分支：
+        demux.src_{local_idx} → queue → nvvideoconvert(RGBA NVMM) → nvdsosd
+                              → 依 YAML 接 顯示 / 存檔（可同時，多者用 tee 分流）
+    並在 nvdsosd.sink 掛 OSD 探針（疊 FPS / ROI）。元件命名用全域 uid，跨 pipeline 不撞名。
     """
-    # demux 的輸出 pad 用「區域」索引；元件命名用「全域 uid」
     src_pad = demux.get_request_pad(f"src_{local_idx}")
 
     q_cam = make_elm("queue", f"q-cam-{uid}")
@@ -273,7 +302,8 @@ def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, os
     caps_osd = make_elm("capsfilter", f"caps_osd_{uid}")
     caps_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
     nvosd_i = make_elm("nvdsosd", f"nvosd-{uid}")
-    nvosd_i.set_property("process-mode", 2)
+    # process-mode：Jetson 用 2（VIC 硬體），dGPU / WSL2 用 1（GPU）
+    nvosd_i.set_property("process-mode", 2 if _is_jetson() else 1)
 
     for elm in [q_cam, nvvidconv_osd, caps_osd, nvosd_i]:
         pipeline.add(elm)
@@ -283,7 +313,7 @@ def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, os
     nvvidconv_osd.link(caps_osd)
     caps_osd.link(nvosd_i)
 
-    # OSD 探針：用「全域 uid」綁定，回呼才知道畫哪一路的 FPS
+    # OSD 探針：用全域 uid 綁定，回呼才知道畫哪一路的 FPS
     nvosd_i.get_static_pad("sink").add_probe(
         Gst.PadProbeType.BUFFER,
         lambda pad, info, u=uid: osd_probe_callback(pad, info, u),
@@ -292,7 +322,6 @@ def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, os
 
     cam_save = cfg.get("output", {}).get("save_output_video", False)
     cam_show = cfg.get("display", {}).get("show_window", True)
-    is_file  = cfg.get("is_file_source", False)
     enabled_branches = sum([cam_save, cam_show])
 
     # 0 個分支：fakesink 收尾
@@ -307,11 +336,8 @@ def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, os
     # 1 個分支：直接 link
     if enabled_branches == 1:
         if cam_save:
-            if is_file:
-                nvosd_i.link(_build_save_branch_for_file(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
-            else:
-                nvosd_i.link(_build_save_branch_for_rtsp(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
-        elif cam_show:
+            nvosd_i.link(_build_save_branch(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
+        else:
             _link_show_branch(pipeline, local_idx, uid, nvosd_i, display_streammux)
         return
 
@@ -324,20 +350,15 @@ def setup_cam_branch(pipeline, local_idx, uid, cfg, demux, display_streammux, os
         q_s = make_elm("queue", f"q-s-{uid}")
         pipeline.add(q_s)
         tee.link(q_s)
-        if is_file:
-            q_s.link(_build_save_branch_for_file(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
-        else:
-            q_s.link(_build_save_branch_for_rtsp(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
+        q_s.link(_build_save_branch(pipeline, uid, cfg["video_path"], cfg["stream_fps"]))
 
     if cam_show:
         _link_show_branch(pipeline, local_idx, uid, tee, display_streammux)
 
-    return
-
 
 def _link_show_branch(pipeline, local_idx, uid, upstream, display_streammux):
     """
-    顯示子分支：queue → nvvideoconvert → display_streammux.sink_{local_idx}
+    顯示子分支：upstream → queue → nvvideoconvert → display_streammux.sink_{local_idx}
     元件命名用 uid（跨 pipeline 不撞名）；顯示 mux 的 pad 用區域 local_idx。
     """
     q_d  = make_elm("queue", f"q-d-{uid}")
