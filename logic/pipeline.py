@@ -81,13 +81,27 @@ def _drain_pad_to_fakesink(pipeline, src_pad):
     src_pad.link(fs.get_static_pad("sink"))
 
 
-def cb_source_setup(decodebin, source_element, user_data):
-    """RTSP 網路攝影機來源的調校：強制 TCP、設定抖動緩衝與逾時（僅對內部 rtspsrc 生效）。"""
-    if source_element.get_name().startswith("rtspsrc"):
-        source_element.set_property("protocols", 4)           # 4 = TCP
-        source_element.set_property("latency", 200)           # 抖動緩衝 200ms
-        source_element.set_property("timeout", 5000000)       # 連線逾時 5 秒（微秒）
-        source_element.set_property("drop-on-latency", True)  # 超過緩衝丟舊幀
+def cb_decodebin_child_added(child_proxy, obj, name, user_data):
+    """
+    nvurisrcbin 內部子元件建立時的回呼（取代原本的 cb_source_setup）。
+      - 遞迴掛到內層 decodebin，才能抓到最底層的 rtspsrc。
+      - 對內部 rtspsrc 強制 TCP、設定連線逾時與抖動緩衝。
+    僅在該元件確實有對應屬性時才設定，避免跨平台/版本差異造成例外。
+    """
+    # 內層還有 decodebin 時，繼續往下掛，才追得到 rtspsrc
+    if name.find("decodebin") != -1:
+        obj.connect("child-added", cb_decodebin_child_added, user_data)
+
+    # 抓到內部 source（rtspsrc）→ 套用與原本相同的調校
+    if name.find("source") != -1:
+        if obj.find_property("protocols") is not None:
+            obj.set_property("protocols", 4)          # 4 = TCP
+        if obj.find_property("timeout") is not None:
+            obj.set_property("timeout", 5000000)      # 連線逾時 5 秒（微秒）
+        if obj.find_property("drop-on-latency") is not None:
+            obj.set_property("drop-on-latency", True) # 超過緩衝丟舊幀
+        if obj.find_property("latency") is not None:
+            obj.set_property("latency", 200)          # 抖動緩衝 200ms
 
 
 def make_elm(gst_type, name):
