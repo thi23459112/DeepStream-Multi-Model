@@ -9,9 +9,13 @@ DeepStream 7.1 車流計數主程式（多權重 / 多 pipeline 版）
     所有 pipeline 跑在「同一個 GLib mainloop」上（官方支援的多 pipeline 同進程做法），
     彼此獨立、互不干擾；q / Ctrl+C 對「所有」pipeline 送 EOS，全部結束才退出。
 
-鍵的觀念：
+關鍵觀念：
     - 全域 stream_uid（SOURCE_CONFIGS 的鍵）跨所有組唯一；state_db / boxmot 都用它當鍵。
-    - 每條 pipeline 內 frame_meta.pad_index 是區域編號，由 probe 用 ctx["pad_to_uid"] 翻譯回 uid。
+    - 每條 pipeline 內 frame_meta.pad_index 是區域編號，由 probe 用 ctx["pad_to_uid"] 翻回 uid。
+
+平台相容：
+    顯示 / OSD / 編碼器的平台差異由 logic/pipeline.py 依 _is_jetson() 自動處理，
+    同一份程式碼可在 Jetson 與 dGPU/WSL2 上執行。
 """
 
 import sys
@@ -20,6 +24,12 @@ import termios
 import tty
 import signal
 import traceback
+
+# GLib/GIO 建立網路（RTSP）連線時會呼叫系統 libproxy 偵測 proxy。在 conda 環境下，
+# conda 的 libstdc++ 與系統 libunwind ABI 不相容，libproxy 拋例外時無法正常 unwind
+# 而導致行程 abort。改用 GIO 內建 dummy proxy resolver 完全繞過 libproxy。
+# 須在匯入 gi 之前設定；Jetson 系統 Python 不受影響，setdefault 也不覆蓋外部既有設定。
+os.environ.setdefault("GIO_USE_PROXY_RESOLVER", "dummy")
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -47,7 +57,7 @@ from logic.probes import (
 # 1. 全域狀態
 # ==========================================
 
-g_loop          = None      # GLib 主迴圈
+g_loop          = None       # GLib 主迴圈
 g_pipelines     = []         # 所有 Gst.Pipeline（每組一條）
 g_eos_done      = set()      # 已 EOS 的 pipeline 名稱集合
 g_eos_triggered = False      # 是否已對所有 pipeline 送過 EOS
@@ -72,7 +82,7 @@ def force_quit_loop():
 
 
 def _send_eos_to_all():
-    """對所有 pipeline 送 EOS（安全結束、等影片封裝）。"""
+    """對所有 pipeline 送 EOS（安全結束、等影片封裝），並設逾時保底。"""
     global g_eos_triggered
     if g_eos_triggered:
         return
@@ -96,8 +106,8 @@ def keyboard_cb(fd, condition):
 def bus_call(bus, message, pipeline_name):
     """
     每條 pipeline 各自的 bus 處理。
-    EOS   → 記錄此 pipeline 已結束；所有 pipeline 都 EOS 才 quit mainloop
-    ERROR → RTSP 來源不穩只警告；其餘嚴重錯誤 → 直接退出（停全部）
+    EOS   → 記錄此 pipeline 已結束；所有 pipeline 都 EOS 才 quit mainloop。
+    ERROR → RTSP 來源不穩只警告（保持運行等重連）；其餘嚴重錯誤 → 直接退出。
     """
     t = message.type
     if t == Gst.MessageType.EOS:
@@ -124,6 +134,7 @@ def bus_call(bus, message, pipeline_name):
 # ==========================================
 
 def _enlarge_queue(q, max_buffers=400):
+    """放大 queue 容量（用於容易累積的節點，如 analytics 前）。"""
     q.set_property("max-size-buffers", max_buffers)
     q.set_property("max-size-bytes", 0)
     q.set_property("max-size-time", 0)
@@ -131,13 +142,8 @@ def _enlarge_queue(q, max_buffers=400):
 
 def build_group_pipeline(group_id, group):
     """
-    為「單一組」建立一條完整、獨立的 Gst.Pipeline。
-
-    參數：
-        group_id (int)
-        group (dict): GROUPS[group_id]，含 weight/engine_path/class_map/member_uids...
-    返回：
-        (pipeline, pipeline_name)
+    為「單一組」建立一條完整、獨立的 Gst.Pipeline，回傳 (pipeline, pipeline_name)。
+    group 內含 weight / engine_path / class_map / member_uids 等（見 config._build_groups）。
     """
     members = group["member_uids"]          # 全域 uid，index 即該組區域 pad_index
     num = len(members)
@@ -199,7 +205,7 @@ def build_group_pipeline(group_id, group):
     for e in elems:
         pipeline.add(e)
 
-    # streammux → q1 → preprocess → q2 → pgie → q3
+    # streammux → q1 → preprocess → q2 → pgie → q3 →（nvdcf 時經 tracker）→ analytics → q4
     streammux.link(q1); q1.link(preprocess); preprocess.link(q2); q2.link(pgie); pgie.link(q3)
     if TRACKER_MODE == "nvdcf":
         q3.link(tracker); tracker.link(q_analytics)
