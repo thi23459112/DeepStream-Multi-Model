@@ -20,6 +20,7 @@ DeepStream 7.1 車流計數主程式（多權重 / 多 pipeline 版）
 
 import sys
 import os
+import time
 import termios
 import tty
 import signal
@@ -41,7 +42,7 @@ from logic.config import (
     TRACKER_CONFIG, TRACKER_MODE, BOXMOT_TRACKER_CONFIG,
     group_infer_config, group_preprocess_config,
 )
-from logic.state_db import initialize_state_managers, force_finalize_all
+from logic.state_db import initialize_state_managers, force_finalize_all, fps_streams
 from logic.pipeline import (
     cb_newpad, cb_decodebin_child_added, make_elm, _safe_set,
     _build_display_sink, setup_cam_branch,
@@ -61,7 +62,12 @@ g_loop          = None       # GLib 主迴圈
 g_pipelines     = []         # 所有 Gst.Pipeline（每組一條）
 g_eos_done      = set()      # 已 EOS 的 pipeline 名稱集合
 g_eos_triggered = False      # 是否已對所有 pipeline 送過 EOS
-
+# ---- 看門狗（單路卡死自動重啟）----
+g_sources        = {}        # uid -> {"src": nvurisrcbin, "streammux": mux, "pad_index": 區域索引}
+g_last_restart   = {}        # uid -> 上次重啟時間戳（防連環重啟）
+WATCHDOG_STALL_SEC   = 60    # 連續幾秒沒吐幀 → 判定卡死
+WATCHDOG_GRACE_SEC   = 60    # 重啟後寬限幾秒（期間不再判定）
+WATCHDOG_CHECK_SEC   = 10    # 每幾秒檢查一次
 
 def _group_analytics_config(group_id):
     """該組的 nvdsanalytics 設定檔路徑（由 traffic_count_txt.py 產生）。"""
@@ -183,6 +189,9 @@ def build_group_pipeline(group_id, group):
         src.connect("child-added", cb_decodebin_child_added, None)
         pipeline.add(src)
 
+        # ⭐ 看門狗：記錄該路 source 與它接到 streammux 的位置（供單路重啟）
+        g_sources[uid] = {"src": src, "streammux": streammux, "pad_index": local_idx}
+
     # ---- 共用推論元件（該組專屬 config）----
     q1          = make_elm("queue", f"q1-g{group_id}")
     q2          = make_elm("queue", f"q2-g{group_id}")
@@ -207,7 +216,7 @@ def build_group_pipeline(group_id, group):
         tracker.set_property("ll-config-file", TRACKER_CONFIG)
         tracker.set_property(
             "ll-lib-file",
-            "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+            "/opt/thi/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
         )
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
@@ -254,6 +263,64 @@ def build_group_pipeline(group_id, group):
 
     return pipeline, gname
 
+def _restart_one_source(uid):
+    """單獨重啟某一路 nvurisrcbin：斷開舊 pad → NULL → release streammux sink → PLAYING。
+    在主線程執行（由 GLib.idle_add 呼叫），不影響其他路。"""
+    info = g_sources.get(uid)
+    if not info:
+        return False
+    src = info["src"]
+    streammux = info["streammux"]
+    pad_index = info["pad_index"]
+    cam = SOURCE_CONFIGS.get(uid, {}).get("source_id", f"uid{uid}")
+
+    print(f"[WATCHDOG] 重啟 {cam}（uid={uid}）...")
+    try:
+        # 1) 斷開 streammux 的 sink pad（若還連著）
+        sinkpad = streammux.get_static_pad(f"sink_{pad_index}")
+        if sinkpad is not None:
+            peer = sinkpad.get_peer()
+            if peer is not None:
+                peer.unlink(sinkpad)
+            # release 掉 request pad，讓重啟後 cb_newpad 能重新接
+            streammux.release_request_pad(sinkpad)
+
+        # 2) 該路 source 設 NULL
+        src.set_state(Gst.State.NULL)
+        src.get_state(Gst.CLOCK_TIME_NONE)  # 等狀態確實切到 NULL
+
+        # 3) 重新 PLAYING（nvurisrcbin 會重連 RTSP、重新吐 pad → 觸發 cb_newpad 接回）
+        src.set_state(Gst.State.PLAYING)
+
+        g_last_restart[uid] = time.time()
+        print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
+    except Exception as e:
+        print(f"[WATCHDOG] 重啟 {cam} 發生例外: {e}")
+    return False  # 給 idle_add 用，只跑一次
+
+
+def _watchdog_check():
+    """每 WATCHDOG_CHECK_SEC 秒檢查各路最後吐幀時間，卡死超過門檻就單路重啟。"""
+    now = time.time()
+    for uid in list(g_sources.keys()):
+        # 重啟寬限期內不判定
+        last_rs = g_last_restart.get(uid, 0)
+        if now - last_rs < WATCHDOG_GRACE_SEC:
+            continue
+
+        stats = fps_streams.get(uid, {})
+        ts = stats.get("timestamps")
+        if not ts:
+            # 還沒收過任何幀（可能剛啟動），跳過
+            continue
+
+        idle = now - ts[-1]
+        if idle >= WATCHDOG_STALL_SEC:
+            cam = SOURCE_CONFIGS.get(uid, {}).get("source_id", f"uid{uid}")
+            print(f"[WATCHDOG] {cam}（uid={uid}）已 {idle:.0f} 秒無新幀，判定卡死 → 單路重啟")
+            GLib.idle_add(_restart_one_source, uid)
+
+    return True  # 回 True 讓 timer 持續
 
 # ==========================================
 # 4. 主程式
@@ -314,6 +381,11 @@ def main():
         print("[INFO] 所有 pipeline 設為 PLAYING...")
         for p in g_pipelines:
             p.set_state(Gst.State.PLAYING)
+
+        # 啟動看門狗：定期檢查各路是否卡死，卡死則單路重啟
+        GLib.timeout_add_seconds(WATCHDOG_CHECK_SEC, _watchdog_check)
+        print(f"[INFO] 看門狗啟動：每 {WATCHDOG_CHECK_SEC}s 檢查，"
+              f"卡死門檻 {WATCHDOG_STALL_SEC}s，重啟寬限 {WATCHDOG_GRACE_SEC}s")
 
         g_loop.run()
     finally:
