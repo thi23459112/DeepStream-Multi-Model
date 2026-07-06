@@ -42,10 +42,13 @@ def _safe_set(elm, name, value):
 # ==========================================
 def cb_newpad(decodebin, decoder_src_pad, data):
     """
-    uridecodebin 解出動態 pad 時的處理：把 video pad 接到該組 streammux 的 sink_{pad_index}。
-    非 video pad（音訊等）或重複的 video pad 一律接 fakesink 消化，避免未連結 pad 造成反壓。
+    nvurisrcbin 解出動態 pad 時的處理：把 video pad 接到該組 streammux 的 sink_{pad_index}。
+    非 video pad（音訊等）接 fakesink 消化。
 
-    data 需含："streammux"（該組 streammux）、"pad_index"（區域 pad index）。
+    重啟支援：若該 sink_{pad_index} 已存在但目前未 link（代表是單路重啟後重新吐 pad），
+    直接重新接上，讓重啟的那一路乾淨接回 streammux。
+
+    data 需含："streammux"、"pad_index"。
     """
     caps = decoder_src_pad.get_current_caps()
     if not caps:
@@ -56,13 +59,19 @@ def cb_newpad(decodebin, decoder_src_pad, data):
     pipeline = streammux.get_parent()
     pad_name = f"sink_{data['pad_index']}"
 
-    # 對已請求過的 request pad 再次 get_request_pad 會回傳 None，故先取回既有 pad
+    # 先取回既有 request pad；沒有才 request 新的
     sinkpad = streammux.get_static_pad(pad_name)
     if sinkpad is None:
         sinkpad = streammux.get_request_pad(pad_name)
 
-    # 非影像流，或該路已接過一條 video → 導到 fakesink 消化，避免佔用/反壓
-    if (not is_video) or sinkpad is None or sinkpad.is_linked():
+    # 非影像流 → 導到 fakesink 消化
+    if not is_video or sinkpad is None:
+        _drain_pad_to_fakesink(pipeline, decoder_src_pad)
+        return
+
+    # 若該 sink pad 已被別的 pad 佔著（linked），才導 fakesink；
+    # 若未 link（首次接、或重啟後重接）→ 直接接上
+    if sinkpad.is_linked():
         _drain_pad_to_fakesink(pipeline, decoder_src_pad)
         return
 
