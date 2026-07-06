@@ -43,7 +43,7 @@ from logic.config import (
 )
 from logic.state_db import initialize_state_managers, force_finalize_all
 from logic.pipeline import (
-    cb_newpad, cb_source_setup, make_elm,
+    cb_newpad, cb_decodebin_child_added, make_elm, _safe_set,
     _build_display_sink, setup_cam_branch,
 )
 from logic.probes import (
@@ -160,14 +160,27 @@ def build_group_pipeline(group_id, group):
     streammux.set_property("nvbuf-memory-type", 0)
     pipeline.add(streammux)
 
-    # ---- 每個成員 cam 一個 uridecodebin ----
+    # ---- 每個成員 cam 一個 nvurisrcbin（內建 RTSP 斷線自動重連）----
     for local_idx, uid in enumerate(members):
         cfg = SOURCE_CONFIGS[uid]
-        src = make_elm("uridecodebin", f"uri-decode-bin-{uid}")
+        # 關鍵修正：改用 nvurisrcbin，uridecodebin 沒有重連能力
+        src = make_elm("nvurisrcbin", f"uri-decode-bin-{uid}")
         src.set_property("uri", cfg["source"])
+
+        # --- RTSP 自動重連（DeepStream 內建，這就是解決黑畫面的核心）---
+        _safe_set(src, "rtsp-reconnect-interval", 5)    # 連續 5 秒收不到資料就重連
+        _safe_set(src, "rtsp-reconnect-attempts", -1)   # -1 = 無限重試，永不放棄
+
+        # --- 傳輸與緩衝（在 nvurisrcbin 層一併設定，強化穩定度）---
+        _safe_set(src, "select-rtp-protocol", 4)        # 4 = 強制 TCP
+        _safe_set(src, "latency", 200)                  # 抖動緩衝 200ms
+        _safe_set(src, "udp-buffer-size", 2000000)
+
         # pad_index 用「區域」索引（接該組 streammux 的 sink_{local_idx}）
+        # nvurisrcbin 同樣以 pad-added 導出 video pad，cb_newpad 可直接沿用
         src.connect("pad-added", cb_newpad, {"streammux": streammux, "pad_index": local_idx})
-        src.connect("source-setup", cb_source_setup, None)
+        # 進一步設定內部 rtspsrc 的 TCP / 逾時（取代原本 source-setup）
+        src.connect("child-added", cb_decodebin_child_added, None)
         pipeline.add(src)
 
     # ---- 共用推論元件（該組專屬 config）----
