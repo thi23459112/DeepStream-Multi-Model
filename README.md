@@ -57,7 +57,6 @@
 - **每組獨立預覽視窗**：tile 佈局自動依成員數排列，可逐路 `show_window` 開關。
 - **畫面疊加**：bbox 用車種色、ID + 車種標籤、左上角即時 FPS。
 - **寫檔輸出**：可選存推論後影片（mp4），含 videorate 穩定 PTS。
-- **無 RTSP 推流**：輸出推流分支已移除。
 
 ## 九、執行 / 結束
 
@@ -66,9 +65,6 @@
 - **結束強制結算**：把還在畫面內的殘留軌跡全部結算寫出。
 - **每 30 秒 FPS 報告**（涵蓋所有 cam）。
 
-## 十、驗證工具
-
-- **`verify_interval.py`**：獨立腳本，唯讀明細 DB → 按分鐘（區間可調）彙總成 `Value` 表格（每方向 + 車種的台數）→ 終端機表格 + CSV，並附對照檢查（明細列數 = Value 加總）。用來驗證區間彙總格式，不碰真實 API。
 
 ---
 
@@ -81,8 +77,6 @@ python traffic_count_txt.py
 # 2. 啟動辨識（多條 pipeline 並行）
 python main.py
 
-# 3.（可選）驗證區間彙總格式
-python verify_interval.py --interval 1
 ```
 
 > **提醒**：更動 ROI / crop_points 後，務必先重跑 `traffic_count_txt.py` 再跑 `main.py`，因為裁切框是在產生設定檔階段計算的。
@@ -101,7 +95,6 @@ python verify_interval.py --interval 1
 | `logic/state_db.py` | 單一合併 SQLite、每台車明細結算與寫入、local_id 管理 |
 | `logic/boxmot_adapter.py` | BoxMOT 追蹤器介接（以 uid 索引） |
 | `logic/color.py` | 類別標籤與顏色 |
-| `verify_interval.py` | 離線驗證：明細 DB → 區間彙總 Value 表格 + CSV |
 | `ds_yaml/*.yaml` | 每路 cam 的設定（來源、weight、ROI、方向、追蹤器等） |
 
 ---
