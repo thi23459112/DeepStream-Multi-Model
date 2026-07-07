@@ -86,6 +86,8 @@ track_logic:
   axis: "y"                            # ⭐ 改這裡切換判斷軸：'y'（上下）或 'x'（左右）
   movement_threshold: 30
   min_roi_hits: 2
+  up_left_is_out: true                 # true ：往上/往左=OUT、往下/往右=IN
+                                       # false：反轉，往上/往左=IN、往下/往右=OUT
 
 # ------------------------------------------------------------
 # 輸出設定 ⭐
