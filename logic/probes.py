@@ -54,6 +54,7 @@ def _process_tracked_frame(frame_meta, current_frame_objects, uid, cfg, class_ma
     tl = cfg.get("track_logic", {})
     movement_threshold = tl.get("movement_threshold", 30)
     axis = tl.get("axis", "y")
+    up_left_is_out = tl.get("up_left_is_out", True)   # 預設：往上/往左=OUT
     keep = cfg.get("keep_classes")      # frozenset 或 None（None = 全收）
 
     l_obj = frame_meta.obj_meta_list
@@ -117,10 +118,13 @@ def _process_tracked_frame(frame_meta, current_frame_objects, uid, cfg, class_ma
         # 方向判斷（首次定向後固定）
         if state["direction"] == "NA":
             delta = (cx - state["start_x"]) if axis == "x" else (cy - state["start_y"])
+            # 軸正向 = 往下(y) / 往右(x)；軸負向 = 往上(y) / 往左(x)
+            # up_left_is_out=True（預設）：往上/往左=flow_out、往下/往右=flow_in
+            # up_left_is_out=False：整個對調
             if delta > movement_threshold:
-                state["direction"] = "flow_in"     # 軸正向（y:向下 / x:向右）
+                state["direction"] = "flow_in" if up_left_is_out else "flow_out"
             elif delta < -movement_threshold:
-                state["direction"] = "flow_out"    # 軸負向（y:向上 / x:向左）
+                state["direction"] = "flow_out" if up_left_is_out else "flow_in"
 
         # OSD 視覺化（用該組 class_map 取名）
         cls_id = obj_meta.class_id
