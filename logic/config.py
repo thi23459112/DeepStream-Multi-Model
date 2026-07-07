@@ -272,6 +272,7 @@ def load_dynamic_configs(yaml_dir):
             "axis":               axis,
             "movement_threshold": int(tl_cfg.get("movement_threshold", 30)),
             "min_roi_hits":       int(tl_cfg.get("min_roi_hits", 2)),
+            "up_left_is_out":     bool(tl_cfg.get("up_left_is_out", True)),
         }
 
         # --- 模型 Engine + 自動推 labels ---
