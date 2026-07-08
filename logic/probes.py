@@ -23,7 +23,7 @@ from logic.color import get_class_color
 from logic.config import SOURCE_CONFIGS
 from logic.state_db import (
     get_local_id, _finalize_one, flush_pending_to_db,
-    track_history, pending_records, last_flush_times,
+    track_history, last_flush_times,
     fps_streams, local_id_maps
 )
 
