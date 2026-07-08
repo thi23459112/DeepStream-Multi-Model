@@ -7,6 +7,8 @@ GStreamer pipeline 元件建構與分支邏輯（多權重 / 多 pipeline 版）
 平台自動適配：
     以 _is_jetson() 判斷平台（Jetson 或 dGPU/WSL2），在「顯示 sink、OSD 處理模式、
     NVENC 編碼器屬性」上自動選用該平台支援的設定，使同一份程式碼於兩種環境皆可執行。
+    寫檔編碼器採延遲偵測：預設 NVENC，建不出時自動退回 CPU x264（USE_CPU_ENCODER 可覆寫）。
+    nvtracker 的 ll-lib-file 由 resolve_tracker_lib() 自動解析（DS_TRACKER_LIB 可覆寫）。
 
 分組觀念：
     依 weight 分組，每組跑一條獨立 pipeline。
@@ -35,6 +37,70 @@ def _safe_set(elm, name, value):
         elm.set_property(name, value)
         return True
     return False
+
+
+# ==========================================
+# 編碼器選擇（延遲偵測）與追蹤器路徑解析
+# ==========================================
+
+def _detect_cpu_encoder():
+    """
+    決定是否使用 CPU 軟體編碼器（x264）。
+
+    規則（可用環境變數 USE_CPU_ENCODER 覆寫，1/true=強制 CPU，0/false=強制 NVENC）：
+      - 環境變數有明確指定 → 依指定
+      - 否則：預設優先使用 NVENC 硬體編碼（較快）；只有在「確實建不出 NVENC」時才退回 CPU，
+              避免在無 NVENC 的環境（如部分 WSL）開存檔就直接中斷。
+    """
+    env = os.environ.get("USE_CPU_ENCODER")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    # 預設 = NVENC。用「實際建立元件」測試（比 ElementFactory.find 更可靠）
+    test = Gst.ElementFactory.make("nvv4l2h264enc", None)
+    if test is not None:
+        print("[INFO] 預設使用 NVENC 硬體編碼（nvv4l2h264enc）")
+        return False
+    print("[INFO] 建不出 NVENC，退回 CPU 軟體編碼（x264）")
+    return True
+
+
+# 編碼器選擇「延遲判斷」：不在 import 當下決定，而是等第一次真正要建編碼器時才判斷並快取。
+# 原因：main.py 是先 import 本模組、之後才呼叫 Gst.init(None)。若在 import 當下判斷，
+# 會早於 Gst.init()，此時 GStreamer 尚未初始化、抓不到 NVENC，導致誤退 CPU。
+_USE_CPU_ENCODER = None   # None=尚未判斷；True/False=已快取
+
+
+def use_cpu_encoder():
+    """回傳是否使用 CPU 編碼；第一次呼叫時才判斷並快取（此時 Gst.init() 已完成，能正確抓到 NVENC）。"""
+    global _USE_CPU_ENCODER
+    if _USE_CPU_ENCODER is None:
+        _USE_CPU_ENCODER = _detect_cpu_encoder()
+    return _USE_CPU_ENCODER
+
+
+def resolve_tracker_lib():
+    """
+    自動解析 nvtracker 的 ll-lib-file 路徑（跨平台 / 跨機器）。
+
+    順序：
+      1. 環境變數 DS_TRACKER_LIB（若指定且存在）
+      2. 依序搜尋常見安裝路徑（含 glob 掃版本號），回傳第一個存在的
+      3. 都找不到 → 回傳標準 NVIDIA 路徑（讓 DS 自行報錯提示）
+    """
+    env = os.environ.get("DS_TRACKER_LIB", "").strip()
+    if env and os.path.exists(env):
+        return env
+    import glob as _glob
+    candidates = [
+        "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        "/opt/thi/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+    ]
+    candidates += sorted(_glob.glob(
+        "/opt/nvidia/deepstream/deepstream*/lib/libnvds_nvmultiobjecttracker.so"))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
 
 
 # ==========================================
@@ -151,10 +217,12 @@ def _get_tile_layout(num_sources):
 # ==========================================
 def _build_save_branch(pipeline, uid, video_path, source_fps):
     """
-    寫檔分支：nvvideoconvert → videorate → capsfilter(NV12,N/1) → nvv4l2h264enc
+    寫檔分支：nvvideoconvert → videorate → capsfilter(N/1) → 編碼器
              → h264parse → qtmux → filesink。
     videorate 以固定 framerate 重打 PTS，避免 live-source 造成 PTS 不規律使 qtmux 拒收。
-    編碼器屬性以 _safe_set 設定，Jetson 專有屬性在 dGPU/WSL2 會自動略過。
+    編碼器依 use_cpu_encoder() 自動選擇：
+      NVENC（預設）：caps 走 NVMM NV12 → nvv4l2h264enc（Jetson/dGPU 屬性以 _safe_set 兼容）。
+      CPU（無 NVENC 時退路）：caps 走系統記憶體 I420 → x264enc（bitrate 單位 kbps）。
     回傳分支起點 element（供上游 link）。
     """
     i = uid
@@ -166,22 +234,32 @@ def _build_save_branch(pipeline, uid, video_path, source_fps):
 
     cap_filter = make_elm("capsfilter", f"cap-filter-save-{i}")
     fps_int = int(round(source_fps)) if source_fps and source_fps > 0 else 30
+    cpu_enc = use_cpu_encoder()
+    caps_base = ("video/x-raw, format=I420" if cpu_enc
+                 else "video/x-raw(memory:NVMM), format=NV12")
     cap_filter.set_property(
         "caps",
-        Gst.Caps.from_string(f"video/x-raw(memory:NVMM), format=NV12, framerate={fps_int}/1"),
+        Gst.Caps.from_string(f"{caps_base}, framerate={fps_int}/1"),
     )
 
-    encoder = make_elm("nvv4l2h264enc", f"encoder-{i}")
-    _safe_set(encoder, "bitrate", 4000000)
-    _safe_set(encoder, "profile", 0)
-    _safe_set(encoder, "iframeinterval", fps_int)
-    # preset-level / insert-sps-pps / maxperf-enable 為 Jetson NVENC 專有；
-    # 若一個都設不成功，代表在 dGPU/WSL2，改設 dGPU NVENC 的調校屬性。
-    if not (_safe_set(encoder, "preset-level", 1)
-            | _safe_set(encoder, "insert-sps-pps", 1)
-            | _safe_set(encoder, "maxperf-enable", 1)):
-        _safe_set(encoder, "preset-id", 1)
-        _safe_set(encoder, "tuning-info-id", 2)
+    if cpu_enc:
+        encoder = make_elm("x264enc", f"encoder-{i}")
+        _safe_set(encoder, "bitrate", 4000)      # x264enc 單位是 kbps
+        _safe_set(encoder, "speed-preset", 1)    # 1=ultrafast，吞吐優先
+        _safe_set(encoder, "tune", 4)            # 4=zerolatency
+        _safe_set(encoder, "key-int-max", fps_int)
+    else:
+        encoder = make_elm("nvv4l2h264enc", f"encoder-{i}")
+        _safe_set(encoder, "bitrate", 4000000)
+        _safe_set(encoder, "profile", 0)
+        _safe_set(encoder, "iframeinterval", fps_int)
+        # preset-level / insert-sps-pps / maxperf-enable 為 Jetson NVENC 專有；
+        # 若一個都設不成功，代表在 dGPU/WSL2，改設 dGPU NVENC 的調校屬性。
+        if not (_safe_set(encoder, "preset-level", 1)
+                | _safe_set(encoder, "insert-sps-pps", 1)
+                | _safe_set(encoder, "maxperf-enable", 1)):
+            _safe_set(encoder, "preset-id", 1)
+            _safe_set(encoder, "tuning-info-id", 2)
 
     parser = make_elm("h264parse", f"h264-parser-{i}")
     muxer = make_elm("qtmux", f"muxer-{i}")
