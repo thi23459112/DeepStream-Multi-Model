@@ -33,6 +33,35 @@ DEFAULT_WEIGHT_IMGSZ = 640
 DEFAULT_WEIGHT_BATCH = 4
 
 TRACKER_RUNTIME_CONFIG = f"{BASE_DIR}/config_tracker_runtime.txt"
+MUX_CONFIG             = f"{BASE_DIR}/config_mux.txt"
+
+# --- 新版 nvstreammux (USE_NEW_NVSTREAMMUX=yes) 用 ---
+# overall-min-fps 自動取各 YAML stream_fps 最高值，但不低於此下限（離線解碼快於即時，保底 30）。
+MUX_MIN_FPS_FLOOR   = 30
+MUX_OVERALL_MAX_FPS = 120
+
+
+def _ds_lib_root() -> str:
+    """
+    自動偵測 DeepStream 的 lib 根目錄（跨平台 / 跨版本）。
+    順序：環境變數 DS_LIB_ROOT → /opt/nvidia/deepstream/deepstream/lib →
+          /opt/nvidia/deepstream/deepstream*/lib（glob 取最後）→ 標準路徑保底。
+    """
+    env = os.environ.get("DS_LIB_ROOT", "").strip()
+    if env and os.path.isdir(env):
+        return env
+    std = "/opt/nvidia/deepstream/deepstream/lib"
+    if os.path.isdir(std):
+        return std
+    hits = sorted(glob.glob("/opt/nvidia/deepstream/deepstream*/lib"))
+    if hits:
+        return hits[-1]
+    return std
+
+
+def resolve_preprocess_lib() -> str:
+    """自動解析 nvdspreprocess 的 custom-lib-path（找不到時以標準 nvidia 路徑保底）。"""
+    return os.path.join(_ds_lib_root(), "gst-plugins", "libcustom2d_preprocess.so")
 
 # engine 檔名常見精度後綴（自動推 labels 時剝掉；需與 logic/config.py 一致）
 _ENGINE_PRECISION_SUFFIXES = ("_fp16", "_fp32", "_int8", "_fp8", "_dla", "_dynamic", "_best")
@@ -245,7 +274,7 @@ def generate_preprocess_config_for_group(group: Dict[str, Any]) -> None:
         "scaling-filter=0",
         "maintain-aspect-ratio=1",
         "symmetric-padding=1",
-        "custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so",
+        f"custom-lib-path={resolve_preprocess_lib()}",
         "custom-tensor-preparation-function=CustomTensorPreparation",
         "",
         "[user-configs]",
@@ -417,6 +446,33 @@ def generate_tracker_runtime_config(cfgs: List[Dict[str, Any]]) -> str:
 # 8. 主流程
 # ==========================================
 
+def generate_mux_config(cfgs: List[Dict[str, Any]]) -> None:
+    """
+    產生 config_mux.txt 給新版 nvstreammux (USE_NEW_NVSTREAMMUX=yes) 讀取。
+    解決：多路檔案來源中某一路先 EOS 時，舊版 mux 空等那一路、每批卡到逾時，剩餘來源 FPS 大跌。
+    adaptive-batching=1 讓 batch 跟現存來源數走；overall-min-fps 決定湊不滿時的強制推出頻率=尾段最低 FPS。
+    多 pipeline 版：各組 streammux 共用這一份（以全部來源的最高 stream_fps 計算）。
+    """
+    fps_list = [float(c.get("stream_fps", 30.0)) for c in cfgs]
+    src_fps = max(fps_list) if fps_list else 30.0
+    min_fps = max(int(round(src_fps)), MUX_MIN_FPS_FLOOR)
+    max_fps = max(min_fps, MUX_OVERALL_MAX_FPS)
+
+    lines = [
+        "[property]",
+        "algorithm-type=1",
+        "adaptive-batching=1",
+        "max-fps-control=0",
+        f"overall-max-fps-n={max_fps}",
+        "overall-max-fps-d=1",
+        f"overall-min-fps-n={min_fps}",
+        "overall-min-fps-d=1",
+    ]
+    with open(MUX_CONFIG, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[INFO] config_mux.txt: 來源最高 stream_fps={src_fps:.0f} → overall-min-fps={min_fps}")
+
+
 def main() -> None:
     print(f"[INFO] BASE_DIR = {BASE_DIR}")
     print("正在載入 YAML 設定檔...")
@@ -444,14 +500,18 @@ def main() -> None:
     # 全組共用一份 tracker runtime
     tracker_mode = generate_tracker_runtime_config(cfgs)
 
+    # 新版 nvstreammux 用的共用設定（USE_NEW_NVSTREAMMUX=yes 時 main.py 會讀）
+    generate_mux_config(cfgs)
+
     print("\n[DONE] 所有設定檔產生完畢！")
     for p in produced:
         print(f"  - {p}")
     print(f"  - {TRACKER_RUNTIME_CONFIG}  (tracker mode = {tracker_mode})")
+    print(f"  - {MUX_CONFIG}  (USE_NEW_NVSTREAMMUX=yes 時使用)")
 
     if tracker_mode != "nvdcf":
         print(f"\n  ⚠ tracker.type = '{tracker_mode}' (BoxMOT)")
-        print(f"     main.py 啟動後將跳過 nvtracker，改在 pgie.src 探針用 BoxMOT 接管")
+        print("     main.py 啟動後將跳過 nvtracker，改在 pgie.src 探針用 BoxMOT 接管")
         print(f"     BoxMOT 微調請直接編輯：boxmot/configs/trackers/{tracker_mode}.yaml")
 
 
