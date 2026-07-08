@@ -11,8 +11,8 @@ send_interval_api.py
     2. 依 (DeviceCode, CameraCode, LocationName, MetricType, DetectClass, 分鐘) 分組
     3. 每組的「明細列數」= Value（一台車一列，故列數 = 台數）
 
-= 上傳邏輯：沿用舊版 PutAPI
-    取 Token (get_token) → 帶 Bearer → POST 到 AiDetectRawData
+= 上傳邏輯：改為整批打包成單一 JSON 陣列一次送出（原本是逐筆 POST）
+    取 Token (get_token) → 帶 Bearer → 一次 POST 整批資料到 AiDetectRawData
     → Token 超過 120 秒自動重新取得 → 由新到舊寫 log
 
 DB schema（logic/state_db.py，本程式以「唯讀 mode=ro」開啟，不影響 DeepStream 寫入）：
@@ -63,6 +63,9 @@ DEFAULT_INTERVAL_MIN = 1
 
 # 上傳視窗：往回取幾分鐘的資料（等同舊版 PutAPI 的「最近 5 分鐘」）
 DEFAULT_LOOKBACK_MIN = 5
+
+# 單次批次請求逾時秒數（整批資料量較大，逾時設長一點）
+REQUEST_TIMEOUT = 30
 
 # CollectTime 在 DB 內的字串格式
 _TIME_FMT = "%Y-%m-%d %H:%M:%S"
@@ -256,51 +259,27 @@ def aggregate(rows, interval_min):
 
 
 # ==========================================
-# 7. 上傳 API（彙總結果逐筆 POST，沿用舊版 PutAPI）
+# 7. 上傳 API（改為整批打包成單一 JSON 一次送出）
 # ==========================================
 
 def send_to_api(summary, dry_run=False):
     """
-    把彙總後的每一列 POST 到 AiDetectRawData。
-    Token 每滿 120 秒自動重新取得；單筆失敗只記錄 log，不中斷其餘上傳。
-    """
-    api_url = f"{API_BASE_URL}/pingits/api/AIData/AiDetectRawData"
-    # CreateTime = 該筆的 CollectTime（區間時間）；UploadTime = 逐筆送出當下時間
+    把彙總後的所有列打包成一個 JSON 陣列，一次 POST 到 AiDetectRawData。
+    Token 若已使用超過 120 秒，會在送出前自動重新取得。
 
+    ⭐ 若中央 API 要求外層要包一個 key（例如 {"Data": [...]}），
+      請把下方 json.dumps(payload) 改成 json.dumps({"Data": payload})。
+    """
     if not summary:
         logging.info("本次沒有可上傳的彙總資料。")
         return
 
-    # --- Dry-run：只印出要送什麼，不實際打 API ---
-    if dry_run:
-        logging.info(f"[DRY-RUN] 本次共 {len(summary)} 筆，僅印出不實際上傳：")
-        for r in summary:
-            preview = dict(r)
-            preview["CreateTime"] = r["CollectTime"]
-            preview["UploadTime"] = datetime.now().strftime(_TIME_FMT)
-            logging.info("  " + json.dumps(preview, ensure_ascii=False))
-        return
+    upload_time = datetime.now().strftime(_TIME_FMT)
 
-    # --- 取得 Token ---
-    token = get_token()
-    if not token:
-        logging.error("無法取得有效 Token，本次上傳作業中止。")
-        return
-    token_time = datetime.now()
-
-    success_count = 0
+    # 組出整批要送的資料（CreateTime = 該筆的 CollectTime；UploadTime = 送出當下時間）
+    payload = []
     for r in summary:
-        # Token 超過 120 秒則重新取得
-        elapsed = (datetime.now() - token_time).total_seconds()
-        if elapsed >= 120:
-            logging.info(f"Token 已使用 {elapsed:.0f} 秒，重新取得 Token。")
-            token = get_token()
-            if not token:
-                logging.error("重新取得 Token 失敗，中止後續上傳。")
-                break
-            token_time = datetime.now()
-
-        data = {
+        payload.append({
             'DeviceCode':   r["DeviceCode"],
             'CameraCode':   r["CameraCode"],
             'LocationName': r["LocationName"],
@@ -309,38 +288,63 @@ def send_to_api(summary, dry_run=False):
             'CollectTime':  r["CollectTime"],
             'Value':        int(r["Value"]),
             'CreateTime':   r["CollectTime"],
-            'UploadTime':   datetime.now().strftime(_TIME_FMT),
-        }
+            'UploadTime':   upload_time,
+        })
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {token}",
-        }
+    # --- Dry-run：只印出要送什麼，不實際打 API ---
+    if dry_run:
+        logging.info(f"[DRY-RUN] 本次共 {len(payload)} 筆，打包後的整批 JSON（僅印出不實際上傳）：")
+        logging.info(json.dumps(payload, ensure_ascii=False))
+        return
 
+    api_url = f"{API_BASE_URL}/pingits/api/AIData/AiDetectRawData"
+
+    # --- 取得 Token ---
+    token = get_token()
+    if not token:
+        logging.error("無法取得有效 Token，本次上傳作業中止。")
+        return
+    token_time = datetime.now()
+
+    # Token 若已快過期，送出前先重新取得一次
+    elapsed = (datetime.now() - token_time).total_seconds()
+    if elapsed >= 120:
+        logging.info(f"Token 已使用 {elapsed:.0f} 秒，重新取得 Token。")
+        token = get_token()
+        if not token:
+            logging.error("重新取得 Token 失敗，中止本次上傳。")
+            return
+
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    json_data = json.dumps(payload, ensure_ascii=False)
+
+    try:
+        logging.info(f"整批打包共 {len(payload)} 筆，一次上傳 → {api_url}")
+        response = requests.post(
+            api_url,
+            data=json_data,
+            headers=headers,
+            verify=False,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        logging.info(f"整批上傳成功，共 {len(payload)} 筆。")
+    except requests.exceptions.RequestException as req_err:
+        resp_body = ""
         try:
-            response = requests.post(
-                api_url,
-                data=json.dumps(data),
-                headers=headers,
-                verify=False,
-                timeout=10,
-            )
-            response.raise_for_status()
-            success_count += 1
-        except requests.exceptions.RequestException as req_err:
-            resp_body = ""
-            try:
-                if req_err.response is not None:
-                    resp_body = req_err.response.text
-            except Exception:
-                pass
-            logging.error(
-                f"上傳資料失敗: {req_err}\n"
-                f"  資料內容  : {json.dumps(data, ensure_ascii=False)}\n"
-                f"  伺服器回應: {resp_body}"
-            )
-
-    logging.info(f"資料處理完成: 彙總 {len(summary)} 筆，成功上傳 {success_count} 筆。")
+            if req_err.response is not None:
+                resp_body = req_err.response.text
+        except Exception:
+            pass
+        logging.error(
+            f"整批上傳失敗: {req_err}\n"
+            f"  伺服器回應: {resp_body}\n"
+            f"  我們送出的 JSON (前 500 字): {json_data[:500]}"
+        )
 
 
 # ==========================================
