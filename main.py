@@ -31,20 +31,23 @@ import traceback
 # 而導致行程 abort。改用 GIO 內建 dummy proxy resolver 完全繞過 libproxy。
 # 須在匯入 gi 之前設定；Jetson 系統 Python 不受影響，setdefault 也不覆蓋外部既有設定。
 os.environ.setdefault("GIO_USE_PROXY_RESOLVER", "dummy")
+# 新版 nvstreammux 開關：export USE_NEW_NVSTREAMMUX=yes 啟用。
+# 解決多路「檔案來源」某一路先 EOS 時，舊版 mux 空等該路、其餘來源 FPS 大跌的問題。
+# 必須在 import gi 之前設定，GStreamer 載入 nvstreammux 外掛時才讀得到。
+os.environ.setdefault("USE_NEW_NVSTREAMMUX", "no")
 
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst
 
-from logic.color import load_labels, CLASS_MAP
 from logic.config import (
     SOURCE_CONFIGS, GROUPS, BASE_DIR,
-    TRACKER_CONFIG, TRACKER_MODE, BOXMOT_TRACKER_CONFIG,
+    TRACKER_CONFIG, TRACKER_MODE,
     group_infer_config, group_preprocess_config,
 )
 from logic.state_db import initialize_state_managers, force_finalize_all, fps_streams
 from logic.pipeline import (
-    cb_newpad, cb_decodebin_child_added, make_elm, _safe_set,
+    cb_newpad, cb_decodebin_child_added, make_elm, _safe_set, resolve_tracker_lib,
     _build_display_sink, setup_cam_branch,
 )
 from logic.probes import (
@@ -80,7 +83,6 @@ def _group_analytics_config(group_id):
 
 def force_quit_loop():
     """EOS 逾時 fallback：等太久仍未全部封裝完成就強制 quit。"""
-    global g_loop
     print("\n[WARNING] 等待影片封裝逾時，強制退出所有管線！")
     if g_loop and g_loop.is_running():
         g_loop.quit()
@@ -158,29 +160,41 @@ def build_group_pipeline(group_id, group):
 
     # ---- streammux（主線）----
     streammux = make_elm("nvstreammux", f"Stream-muxer-g{group_id}")
-    streammux.set_property("width", 1920)
-    streammux.set_property("height", 1080)
-    streammux.set_property("batch-size", num)          # 該組成員數
-    streammux.set_property("batched-push-timeout", 16666)
-    streammux.set_property("live-source", 1)
-    streammux.set_property("nvbuf-memory-type", 0)
+    streammux.set_property("batch-size", num)          # 該組成員數（新舊版 mux 皆支援）
+    if os.environ.get("USE_NEW_NVSTREAMMUX") == "yes":
+        # 新版 mux：不接受 width/height/live-source 等舊屬性，改讀 config_mux.txt
+        _mux_cfg = os.path.join(BASE_DIR, "config_mux.txt")
+        if os.path.exists(_mux_cfg):
+            streammux.set_property("config-file-path", _mux_cfg)
+        else:
+            print(f"[WARNING] 找不到 {_mux_cfg}，新版 mux 將用內建預設值（請先跑 traffic_count_txt.py）")
+    else:
+        # 舊版 mux：維持原本設定
+        streammux.set_property("width", 1920)
+        streammux.set_property("height", 1080)
+        streammux.set_property("batched-push-timeout", 16666)
+        streammux.set_property("live-source", 1)
+        streammux.set_property("nvbuf-memory-type", 0)
     pipeline.add(streammux)
 
-    # ---- 每個成員 cam 一個 nvurisrcbin（內建 RTSP 斷線自動重連）----
+    # ---- 每個成員 cam 一個 nvurisrcbin（RTSP 路啟用內建斷線自動重連）----
     for local_idx, uid in enumerate(members):
         cfg = SOURCE_CONFIGS[uid]
         # 關鍵修正：改用 nvurisrcbin，uridecodebin 沒有重連能力
         src = make_elm("nvurisrcbin", f"uri-decode-bin-{uid}")
         src.set_property("uri", cfg["source"])
 
-        # --- RTSP 自動重連（DeepStream 內建，這就是解決黑畫面的核心）---
-        _safe_set(src, "rtsp-reconnect-interval", 5)    # 連續 5 秒收不到資料就重連
-        _safe_set(src, "rtsp-reconnect-attempts", -1)   # -1 = 無限重試，永不放棄
+        is_live = not cfg.get("is_file_source", False)
+        if is_live:
+            # --- RTSP 自動重連（DeepStream 內建，這就是解決黑畫面的核心）---
+            _safe_set(src, "rtsp-reconnect-interval", 5)    # 連續 5 秒收不到資料就重連
+            _safe_set(src, "rtsp-reconnect-attempts", -1)   # -1 = 無限重試，永不放棄
 
-        # --- 傳輸與緩衝（在 nvurisrcbin 層一併設定，強化穩定度）---
-        _safe_set(src, "select-rtp-protocol", 4)        # 4 = 強制 TCP
-        _safe_set(src, "latency", 200)                  # 抖動緩衝 200ms
-        _safe_set(src, "udp-buffer-size", 2000000)
+            # --- 傳輸與緩衝（在 nvurisrcbin 層一併設定，強化穩定度）---
+            _safe_set(src, "select-rtp-protocol", 4)        # 4 = 強制 TCP
+            _safe_set(src, "latency", 200)                  # 抖動緩衝 200ms
+            _safe_set(src, "udp-buffer-size", 2000000)
+            print(f"[INFO] {cfg.get('source_id', uid)} 為即時串流：啟用自動重連（5s 間隔、無限重試）")
 
         # pad_index 用「區域」索引（接該組 streammux 的 sink_{local_idx}）
         # nvurisrcbin 同樣以 pad-added 導出 video pad，cb_newpad 可直接沿用
@@ -189,8 +203,10 @@ def build_group_pipeline(group_id, group):
         src.connect("child-added", cb_decodebin_child_added, None)
         pipeline.add(src)
 
-        # ⭐ 看門狗：記錄該路 source 與它接到 streammux 的位置（供單路重啟）
-        g_sources[uid] = {"src": src, "streammux": streammux, "pad_index": local_idx}
+        # ⭐ 看門狗：只登記「即時串流」路（檔案來源播完不吐幀是正常現象，
+        #    絕不能重啟——否則影片會從頭重播、DB 重複計數）
+        if is_live:
+            g_sources[uid] = {"src": src, "streammux": streammux, "pad_index": local_idx}
 
     # ---- 共用推論元件（該組專屬 config）----
     q1          = make_elm("queue", f"q1-g{group_id}")
@@ -214,10 +230,7 @@ def build_group_pipeline(group_id, group):
     if TRACKER_MODE == "nvdcf":
         tracker = make_elm("nvtracker", f"tracker-g{group_id}")
         tracker.set_property("ll-config-file", TRACKER_CONFIG)
-        tracker.set_property(
-            "ll-lib-file",
-            "/opt/thi/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
-        )
+        tracker.set_property("ll-lib-file", resolve_tracker_lib())
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
 
@@ -269,6 +282,8 @@ def _restart_one_source(uid):
     info = g_sources.get(uid)
     if not info:
         return False
+    if g_eos_triggered:      # 已在收尾流程 → 不再重啟，避免干擾影片封裝
+        return False
     src = info["src"]
     streammux = info["streammux"]
     pad_index = info["pad_index"]
@@ -300,7 +315,12 @@ def _restart_one_source(uid):
 
 
 def _watchdog_check():
-    """每 WATCHDOG_CHECK_SEC 秒檢查各路最後吐幀時間，卡死超過門檻就單路重啟。"""
+    """每 WATCHDOG_CHECK_SEC 秒檢查各「RTSP 路」最後吐幀時間，卡死超過門檻就單路重啟。
+    只監控 g_sources 內的路（建立來源時只收錄即時串流，檔案來源不在其中）。
+    EOS 觸發（按 Q / SIGINT / SIGTERM）後回傳 False 停止本 timer，不干擾收尾封裝。"""
+    if g_eos_triggered:
+        print("[WATCHDOG] 偵測到 EOS 收尾流程，看門狗停止")
+        return False
     now = time.time()
     for uid in list(g_sources.keys()):
         # 重啟寬限期內不判定
@@ -382,10 +402,11 @@ def main():
         for p in g_pipelines:
             p.set_state(Gst.State.PLAYING)
 
-        # 啟動看門狗：定期檢查各路是否卡死，卡死則單路重啟
-        GLib.timeout_add_seconds(WATCHDOG_CHECK_SEC, _watchdog_check)
-        print(f"[INFO] 看門狗啟動：每 {WATCHDOG_CHECK_SEC}s 檢查，"
-              f"卡死門檻 {WATCHDOG_STALL_SEC}s，重啟寬限 {WATCHDOG_GRACE_SEC}s")
+        # 啟動看門狗：只有存在 RTSP 路時才需要（檔案批次跑不啟動、也不該監控）
+        if g_sources:
+            GLib.timeout_add_seconds(WATCHDOG_CHECK_SEC, _watchdog_check)
+            print(f"[INFO] 看門狗啟動：監控 {len(g_sources)} 路即時串流，"
+                  f"每 {WATCHDOG_CHECK_SEC}s 檢查，卡死門檻 {WATCHDOG_STALL_SEC}s，重啟寬限 {WATCHDOG_GRACE_SEC}s")
 
         g_loop.run()
     finally:
