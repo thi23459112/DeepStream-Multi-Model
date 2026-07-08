@@ -11,7 +11,7 @@ BoxMOT 追蹤器轉接層
 """
 
 import numpy as np
-from boxmot import create_tracker, get_tracker_config
+from boxmot import create_tracker
 
 from logic.config import (
     SOURCE_CONFIGS, TRACKER_MODE, BOXMOT_TRACKER_CONFIG,
