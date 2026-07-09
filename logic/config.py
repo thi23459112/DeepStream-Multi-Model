@@ -314,7 +314,7 @@ def load_dynamic_configs(yaml_dir):
             video_dir = os.path.join(BASE_DIR, video_dir)
         if output_cfg.get("save_output_video", False):
             os.makedirs(video_dir, exist_ok=True)
-        data["video_path"] = os.path.join(video_dir, f"{cam_name}_output.mp4")
+        data["video_path"] = os.path.join(video_dir, f"{cam_name}_output.mkv")
 
         # --- 來源 URI 解析 ---
         source_uri = _resolve_source_uri(data.get("source", ""))
