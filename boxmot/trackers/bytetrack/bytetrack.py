@@ -13,6 +13,8 @@ from boxmot.utils.matching import fuse_score, iou_distance, linear_assignment
 from boxmot.utils.ops import tlwh2xyah, xywh2tlwh, xywh2xyxy, xyxy2xywh
 
 
+_MAX_REMOVED_STRACKS = 1000   # 防止 removed_stracks 無限成長(記憶體洩漏 + 每幀 sub_stracks 遍歷漸慢)
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilterXYAH()
     shared_kalman_obb = KalmanFilterXYWH(ndim=5)
@@ -392,6 +394,8 @@ class ByteTrack(BaseTracker):
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
+        if len(self.removed_stracks) > _MAX_REMOVED_STRACKS:
+            self.removed_stracks = self.removed_stracks[-_MAX_REMOVED_STRACKS:]
         self.active_tracks, self.lost_stracks = remove_duplicate_stracks(
             self.active_tracks, self.lost_stracks
         )
