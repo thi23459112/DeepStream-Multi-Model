@@ -18,6 +18,8 @@ from boxmot.utils.matching import (embedding_distance, fuse_score,
                                    iou_distance, linear_assignment)
 
 
+_MAX_REMOVED_STRACKS = 1000   # 防止 removed_stracks 無限成長(記憶體洩漏 + 每幀 sub_stracks 遍歷漸慢)
+
 class BotSort(BaseTracker):
     supports_obb = True
 
@@ -475,6 +477,8 @@ class BotSort(BaseTracker):
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
+        if len(self.removed_stracks) > _MAX_REMOVED_STRACKS:
+            self.removed_stracks = self.removed_stracks[-_MAX_REMOVED_STRACKS:]
         self.active_tracks, self.lost_stracks = remove_duplicate_stracks(
             self.active_tracks, self.lost_stracks
         )
