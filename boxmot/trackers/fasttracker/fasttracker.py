@@ -11,6 +11,10 @@ from boxmot.trackers.basetracker import BaseTracker
 from boxmot.trackers.fasttracker.basetrack import BaseTrack, TrackState
 from boxmot.utils import matching
 
+# ⭐ 上限常數（防止長時間執行時記憶體洩漏 / 每幀處理漸慢）
+_MAX_REMOVED_STRACKS = 1000   # removed_stracks 只需保留近窗，供 sub_stracks 剔除最近剛移除者
+_MAX_CENTER_HISTORY  = 300    # 單一 track 的軌跡點上限（軌跡平滑只讀最近數點；防長壽 track 無限長）
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilterXYAH()
 
@@ -104,6 +108,8 @@ class STrack(BaseTrack):
         
         self.history_observations.append(self.xyxy)
         self.center_history.append(self._get_center_from_tlwh(self.tlwh))
+        if len(self.center_history) > _MAX_CENTER_HISTORY:
+            self.center_history = self.center_history[-_MAX_CENTER_HISTORY:]
 
     def update(self, new_track, frame_id):
         self.frame_id = frame_id
@@ -126,6 +132,8 @@ class STrack(BaseTrack):
         
         self.history_observations.append(self.xyxy)
         self.center_history.append(self._get_center_from_tlwh(self.tlwh))
+        if len(self.center_history) > _MAX_CENTER_HISTORY:
+            self.center_history = self.center_history[-_MAX_CENTER_HISTORY:]
 
     @property
     def tlwh(self):
@@ -444,6 +452,11 @@ class FastTracker(BaseTracker):
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
+        # ⭐ 防止 removed_stracks 無限成長：它只在上一行 sub_stracks 用來剔除「最近剛移除」
+        #    的 track，保留近窗即足夠，久遠的 track 永遠不會再復用。不設上限會導致：
+        #    (1) 記憶體隨歷來車輛總數單調洩漏；(2) 每幀 sub_stracks 遍歷此清單愈來愈慢 → FPS 漸降。
+        if len(self.removed_stracks) > _MAX_REMOVED_STRACKS:
+            self.removed_stracks = self.removed_stracks[-_MAX_REMOVED_STRACKS:]
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
 
         self.active_tracks = self.tracked_stracks
@@ -473,6 +486,8 @@ class FastTracker(BaseTracker):
         
         if len(t.center_history) == 0 or not np.allclose(t.center_history[-1], curr_center):
             t.center_history.append(curr_center.copy())
+            if len(t.center_history) > _MAX_CENTER_HISTORY:
+                t.center_history = t.center_history[-_MAX_CENTER_HISTORY:]
 
         roi_idx = -1
         for i, roi in enumerate(self.roi_points):
