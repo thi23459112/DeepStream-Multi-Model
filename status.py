@@ -54,7 +54,7 @@ def auto_detect_project_dir() -> Path:
     for parent in [script_dir] + list(script_dir.parents):
         if (parent / "main.py").exists():
             return parent
-    return Path("/home/thi/THI/DeepStream-Multi-Model")
+    return Path("/home/nvidia/THI/DeepStream-Multi-Model")
 
 
 PROJECT_DIR = auto_detect_project_dir()
