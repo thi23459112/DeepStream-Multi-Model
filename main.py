@@ -66,11 +66,18 @@ g_pipelines     = []         # 所有 Gst.Pipeline（每組一條）
 g_eos_done      = set()      # 已 EOS 的 pipeline 名稱集合
 g_eos_triggered = False      # 是否已對所有 pipeline 送過 EOS
 # ---- 看門狗（單路卡死自動重啟）----
-g_sources        = {}        # uid -> {"src": nvurisrcbin, "streammux": mux, "pad_index": 區域索引}
+g_sources        = {}        # uid -> {"src", "streammux", "pad_index", "pipeline", "cfg", "rebuilds"}
 g_last_restart   = {}        # uid -> 上次重啟時間戳（防連環重啟）
+g_stall_notify   = {}        # uid -> 具名卡幀通知累計次數（恢復吐幀即歸零）
+g_restart_counts = {}        # uid -> 看門狗連續重啟/重建次數（恢復吐幀即歸零）
 WATCHDOG_STALL_SEC   = 60    # 連續幾秒沒吐幀 → 判定卡死
 WATCHDOG_GRACE_SEC   = 60    # 重啟後寬限幾秒（期間不再判定）
 WATCHDOG_CHECK_SEC   = 10    # 每幾秒檢查一次
+WATCHDOG_NOTIFY_SEC  = 15    # 卡幀超過此秒數即開始「具名」回報（早於重啟門檻，方便定位是哪一路）
+WATCHDOG_MIN_FPS     = 1.0   # 滴幀偵測門檻：觀察窗內平均 FPS 低於此值視同卡死。堵住「內建重連
+                             # 半成功、每次滴進幾幀把 idle 重置，導致看門狗永遠不觸發」的漏洞
+WATCHDOG_REBUILD_AFTER = 3   # 同一路連續整顆重啟 N 次仍未恢復 → 升級為「移除元件、全新重建」
+                             # （全新 RTSP session，等效手動關掉播放器重開，可跳出半成功迴圈）
 
 def _group_analytics_config(group_id):
     """該組的 nvdsanalytics 設定檔路徑（由 traffic_count_txt.py 產生）。"""
@@ -180,33 +187,17 @@ def build_group_pipeline(group_id, group):
     # ---- 每個成員 cam 一個 nvurisrcbin（RTSP 路啟用內建斷線自動重連）----
     for local_idx, uid in enumerate(members):
         cfg = SOURCE_CONFIGS[uid]
-        # 關鍵修正：改用 nvurisrcbin，uridecodebin 沒有重連能力
-        src = make_elm("nvurisrcbin", f"uri-decode-bin-{uid}")
-        src.set_property("uri", cfg["source"])
+        # 建立 + 屬性 + 訊號統一走 _create_source_element（初次與看門狗「重建」共用，設定保證一致）
+        src = _create_source_element(uid, local_idx, cfg, streammux)
+        pipeline.add(src)
 
         is_live = not cfg.get("is_file_source", False)
         if is_live:
-            # --- RTSP 自動重連（DeepStream 內建，這就是解決黑畫面的核心）---
-            _safe_set(src, "rtsp-reconnect-interval", 5)    # 連續 5 秒收不到資料就重連
-            _safe_set(src, "rtsp-reconnect-attempts", -1)   # -1 = 無限重試，永不放棄
-
-            # --- 傳輸與緩衝（在 nvurisrcbin 層一併設定，強化穩定度）---
-            _safe_set(src, "select-rtp-protocol", 4)        # 4 = 強制 TCP
-            _safe_set(src, "latency", 200)                  # 抖動緩衝 200ms
-            _safe_set(src, "udp-buffer-size", 2000000)
             print(f"[INFO] {cfg.get('source_id', uid)} 為即時串流：啟用自動重連（5s 間隔、無限重試）")
-
-        # pad_index 用「區域」索引（接該組 streammux 的 sink_{local_idx}）
-        # nvurisrcbin 同樣以 pad-added 導出 video pad，cb_newpad 可直接沿用
-        src.connect("pad-added", cb_newpad, {"streammux": streammux, "pad_index": local_idx})
-        # 進一步設定內部 rtspsrc 的 TCP / 逾時（取代原本 source-setup）
-        src.connect("child-added", cb_decodebin_child_added, None)
-        pipeline.add(src)
-
-        # ⭐ 看門狗：只登記「即時串流」路（檔案來源播完不吐幀是正常現象，
-        #    絕不能重啟——否則影片會從頭重播、DB 重複計數）
-        if is_live:
-            g_sources[uid] = {"src": src, "streammux": streammux, "pad_index": local_idx}
+            # ⭐ 看門狗：只登記「即時串流」路（檔案來源播完不吐幀是正常現象，
+            #    絕不能重啟——否則影片會從頭重播、DB 重複計數）。cfg/pipeline 供「重建」用。
+            g_sources[uid] = {"src": src, "streammux": streammux, "pad_index": local_idx,
+                              "pipeline": pipeline, "cfg": cfg, "rebuilds": 0}
 
     # ---- 共用推論元件（該組專屬 config）----
     q1          = make_elm("queue", f"q1-g{group_id}")
@@ -276,6 +267,32 @@ def build_group_pipeline(group_id, group):
 
     return pipeline, gname
 
+def _create_source_element(uid, local_idx, cfg, streammux):
+    """
+    建立並設定一顆 nvurisrcbin（URI、RTSP 重連屬性、pad-added / child-added 訊號）。
+    不加入 pipeline、不設狀態——由呼叫端處理。初次建立與看門狗「重建」共用，設定保證一致。
+    命名帶重建代數（-rN）避免與舊元件撞名。
+    """
+    n = 0
+    info = g_sources.get(uid)
+    if info:
+        n = info.get("rebuilds", 0)
+    name = f"uri-decode-bin-{uid}" + (f"-r{n}" if n else "")
+    src = make_elm("nvurisrcbin", name)
+    src.set_property("uri", cfg["source"])
+    if not cfg.get("is_file_source", False):
+        # source-id：讓 nvurisrcbin 內建訊息（Resetting source N）能辨識是哪一路（不設會印 -1）
+        _safe_set(src, "source-id", uid)
+        _safe_set(src, "rtsp-reconnect-interval", 5)    # 連續 5 秒收不到資料就重連
+        _safe_set(src, "rtsp-reconnect-attempts", -1)   # -1 = 無限重試，永不放棄
+        _safe_set(src, "select-rtp-protocol", 4)        # 4 = 強制 TCP
+        _safe_set(src, "latency", 200)                  # 抖動緩衝 200ms
+        _safe_set(src, "udp-buffer-size", 2000000)
+    src.connect("pad-added", cb_newpad, {"streammux": streammux, "pad_index": local_idx})
+    src.connect("child-added", cb_decodebin_child_added, None)
+    return src
+
+
 def _restart_one_source(uid):
     """單獨重啟某一路 nvurisrcbin：斷開舊 pad → NULL → release streammux sink → PLAYING。
     在主線程執行（由 GLib.idle_add 呼叫），不影響其他路。"""
@@ -289,7 +306,11 @@ def _restart_one_source(uid):
     pad_index = info["pad_index"]
     cam = SOURCE_CONFIGS.get(uid, {}).get("source_id", f"uid{uid}")
 
-    print(f"[WATCHDOG] 重啟 {cam}（uid={uid}）...")
+    g_restart_counts[uid] = g_restart_counts.get(uid, 0) + 1
+    n = g_restart_counts[uid]
+    rebuild = n > WATCHDOG_REBUILD_AFTER   # 前 N 次：整顆重啟；之後每次：移除元件全新重建
+    print(f"[WATCHDOG] {'重建' if rebuild else '重啟'} {cam}（uid={uid}）— 連續第 {n} 次"
+          + (f"（前 {WATCHDOG_REBUILD_AFTER} 次重啟未恢復 → 升級為移除元件、建立全新 RTSP session）" if rebuild and n == WATCHDOG_REBUILD_AFTER + 1 else ""))
     try:
         # 1) 斷開 streammux 的 sink pad（若還連著）
         sinkpad = streammux.get_static_pad(f"sink_{pad_index}")
@@ -304,13 +325,26 @@ def _restart_one_source(uid):
         src.set_state(Gst.State.NULL)
         src.get_state(Gst.CLOCK_TIME_NONE)  # 等狀態確實切到 NULL
 
-        # 3) 重新 PLAYING（nvurisrcbin 會重連 RTSP、重新吐 pad → 觸發 cb_newpad 接回）
-        src.set_state(Gst.State.PLAYING)
-
-        g_last_restart[uid] = time.time()
-        print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
+        if rebuild:
+            # 3a) 升級路徑：把舊元件整顆移出該組 pipeline，建立「全新」nvurisrcbin。
+            #     全新元件 = 全新 rtspsrc / 全新 TCP 連線 / 內部狀態歸零，
+            #     等效手動關掉播放器重開，可跳出「半成功重連迴圈」等內部卡死狀態。
+            grp_pipeline = info["pipeline"]
+            grp_pipeline.remove(src)
+            info["rebuilds"] = info.get("rebuilds", 0) + 1
+            new_src = _create_source_element(uid, pad_index, info["cfg"], streammux)
+            grp_pipeline.add(new_src)
+            new_src.sync_state_with_parent()
+            info["src"] = new_src
+            g_last_restart[uid] = time.time()
+            print(f"[WATCHDOG] {cam} 已重建為全新元件（{new_src.get_name()}），等待重新連線...")
+        else:
+            # 3b) 一般路徑：重新 PLAYING（nvurisrcbin 會重連 RTSP、重新吐 pad → cb_newpad 接回）
+            src.set_state(Gst.State.PLAYING)
+            g_last_restart[uid] = time.time()
+            print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
     except Exception as e:
-        print(f"[WATCHDOG] 重啟 {cam} 發生例外: {e}")
+        print(f"[WATCHDOG] {'重建' if rebuild else '重啟'} {cam} 發生例外: {e}")
     return False  # 給 idle_add 用，只跑一次
 
 
@@ -335,9 +369,32 @@ def _watchdog_check():
             continue
 
         idle = now - ts[-1]
-        if idle >= WATCHDOG_STALL_SEC:
-            cam = SOURCE_CONFIGS.get(uid, {}).get("source_id", f"uid{uid}")
-            print(f"[WATCHDOG] {cam}（uid={uid}）已 {idle:.0f} 秒無新幀，判定卡死 → 單路重啟")
+        cam = SOURCE_CONFIGS.get(uid, {}).get("source_id", f"uid{uid}")
+
+        # --- 滴幀偵測：內建重連「半成功」時每次會滴進幾幀，idle 一直被重置，
+        #     單看 idle 永遠不會達標。改看觀察窗平均 FPS：最近 len(ts) 幀共花 span 秒，
+        #     健康 15fps 串流 30 幀約 2 秒；若 span 已超過卡死門檻仍湊不滿，就是滴幀卡死。
+        span = now - ts[0]
+        rate = (len(ts) / span) if span > 0 else 999.0
+        trickle = (span >= WATCHDOG_STALL_SEC and rate < WATCHDOG_MIN_FPS)
+        stalled = (idle >= WATCHDOG_STALL_SEC) or trickle
+
+        # --- 具名狀態回報：一眼看出是哪一路在卡、卡多久、通知第幾次 ---
+        if idle >= WATCHDOG_NOTIFY_SEC or trickle:
+            g_stall_notify[uid] = g_stall_notify.get(uid, 0) + 1
+            desc = (f"已 {idle:.0f}s 無新幀" if idle >= WATCHDOG_NOTIFY_SEC
+                    else f"滴幀中（近 {span:.0f}s 平均僅 {rate:.2f} FPS）")
+            print(f"[{cam}] {desc}（nvurisrcbin 內建重連中）— 第 {g_stall_notify[uid]} 次通知")
+        elif g_stall_notify.get(uid, 0) > 0:
+            print(f"[{cam}] ✅ 已恢復吐幀（先前通知 {g_stall_notify[uid]} 次、"
+                  f"看門狗重啟/重建 {g_restart_counts.get(uid, 0)} 次）")
+            g_stall_notify[uid] = 0
+            g_restart_counts[uid] = 0
+            g_sources[uid]["rebuilds"] = 0
+
+        if stalled:
+            reason = f"已 {idle:.0f} 秒無新幀" if idle >= WATCHDOG_STALL_SEC else f"滴幀（近 {span:.0f}s 平均 {rate:.2f} FPS）"
+            print(f"[WATCHDOG] {cam}（uid={uid}）{reason}，判定卡死 → 單路處置")
             GLib.idle_add(_restart_one_source, uid)
 
     return True  # 回 True 讓 timer 持續
