@@ -54,7 +54,7 @@ USER_ID       = "AiAPI"        # 使用者帳號
 PASSWORD      = "Msaj#aV6Lh"   # 使用者密碼（⚠️ 敏感資訊，建議改用環境變數）
 
 # ---- 資料庫與彙總設定 ----
-DEFAULT_DB_PATH = "/home/thi/THI/DeepStream-Multi-Model/output_db/traffic_count.db"  # 明細 DB 預設路徑（可被 --db 覆寫）
+DEFAULT_DB_PATH = "/home/nvidia/THI/DeepStream-Multi-Model/output_db/traffic_count.db"  # 明細 DB 預設路徑（可被 --db 覆寫）
 DEFAULT_INTERVAL_MIN = 1       # 彙總區間分鐘數（通常為 1）
 DEFAULT_LOOKBACK_MIN = 5       # 首次部署時，往回取幾分鐘的資料（等同舊版視窗）
 
