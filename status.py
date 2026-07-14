@@ -11,6 +11,7 @@
 #     - 上傳排程由「crontab 單隻 PutAPI」改為「systemd timer」
 #       （send-api-cloud.timer）
 #     - 上傳 log 改讀各自的 .log 檔
+#     - 兩個日誌窗口改為等高顯示
 # =============================================================
 
 import subprocess
@@ -63,8 +64,7 @@ PROJECT_DIR = auto_detect_project_dir()
 CLOUD_LOG = str(PROJECT_DIR / "send_interval_api.live.log")
 
 # 固定設定
-MAX_KEEP        = 500      # 日誌保留行數
-API_PANEL_ROWS  = 12       # 上傳 log 面板行數
+MAX_KEEP = 500      # 日誌保留行數
 
 
 # =============================================================
@@ -231,20 +231,22 @@ def render_dashboard(term_height: int) -> Layout:
         border_style="dim",
     )
 
-    # ----- 面板高度計算 -----
-    # 版面：header(3) + 辨識 + 雲端(API_PANEL_ROWS) + footer(3)
-    recog_lines = max(3, term_height - 6 - API_PANEL_ROWS - 2)
+    # ----- 面板高度計算（兩個日誌面板等高）-----
+    # 可用高度 = 總高 - header(3) - footer(3)，剩下的由兩個面板平分
+    avail = max(6, term_height - 6)
+    each_panel_height = avail // 2
+    log_lines = max(3, each_panel_height - 2)  # 扣掉面板本身上下邊框各 1 行
 
-    recog_panel = make_log_panel(recog_buffer, recog_lines,
+    recog_panel = make_log_panel(recog_buffer, log_lines,
                                  "📡 辨識即時日誌", "bright_blue")
-    cloud_panel = make_log_panel(cloud_buffer, API_PANEL_ROWS - 2,
+    cloud_panel = make_log_panel(cloud_buffer, log_lines,
                                  "☁️ 雲端上傳日誌 (send_interval_api)", "magenta")
 
     layout = Layout()
     layout.split_column(
         Layout(header, size=3),
-        Layout(recog_panel),
-        Layout(cloud_panel, size=API_PANEL_ROWS),
+        Layout(recog_panel),   # 不給 size → 與下方平分
+        Layout(cloud_panel),   # 不給 size → 與上方平分
         Layout(footer, size=3),
     )
     return layout
