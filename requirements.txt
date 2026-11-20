@@ -1,0 +1,9 @@
+gdown
+ftfy
+regex
+loguru
+lapx
+pandas
+scipy
+requests
+rich
